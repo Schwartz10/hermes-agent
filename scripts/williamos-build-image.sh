@@ -127,17 +127,17 @@ if [ "$SMOKE" -eq 1 ]; then
 
   echo "Smoke testing $IMAGE"
   docker run --rm \
+    --platform "$PLATFORM" \
     -e "HERMES_UID=$(id -u)" \
     -e "HERMES_GID=$(id -g)" \
     -v "$SMOKE_HOME:/opt/data" \
-    --entrypoint /opt/hermes/docker/entrypoint.sh \
     "$IMAGE" --help >/dev/null
 
   docker run --rm \
+    --platform "$PLATFORM" \
     -e "HERMES_UID=$(id -u)" \
     -e "HERMES_GID=$(id -g)" \
     -v "$SMOKE_HOME:/opt/data" \
-    --entrypoint /opt/hermes/docker/entrypoint.sh \
     "$IMAGE" dashboard --help >/dev/null
 fi
 
