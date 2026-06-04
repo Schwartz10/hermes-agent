@@ -1553,6 +1553,7 @@ class APIServerAdapter(BasePlatformAdapter):
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
         run_id = f"run_{uuid.uuid4().hex}"
+        tool_started_at: dict[str, float] = {}
         seq = 0
 
         def _event_payload(name: str, payload: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
@@ -1585,9 +1586,57 @@ class APIServerAdapter(BasePlatformAdapter):
         def _tool_progress(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs) -> None:
             if event_type == "reasoning.available":
                 _enqueue("tool.progress", {"message_id": message_id, "tool_name": tool_name or "_thinking", "delta": preview or ""})
-            elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                event_name = event_type.replace("tool.", "tool.")
-                _enqueue(event_name, {"message_id": message_id, "tool_name": tool_name, "preview": preview, "args": args})
+
+        def _tool_result_preview(result, max_chars=500):
+            if result is None:
+                return ""
+            if not isinstance(result, str):
+                try:
+                    result = json.dumps(result, ensure_ascii=False)
+                except Exception:
+                    result = str(result)
+            result = " ".join(result.split())
+            if len(result) > max_chars:
+                return result[: max_chars - 1].rstrip() + "…"
+            return result
+
+        def _on_tool_start(tool_call_id, function_name, function_args):
+            if not tool_call_id or not function_name or function_name.startswith("_"):
+                return
+            tool_started_at[tool_call_id] = time.monotonic()
+            preview = None
+            try:
+                from agent.display import build_tool_preview
+                preview = build_tool_preview(function_name, function_args)
+            except Exception:
+                preview = None
+            _enqueue("tool.started", {
+                "message_id": message_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": function_name,
+                "preview": preview or function_name,
+                "args": function_args or {},
+            })
+
+        def _on_tool_complete(tool_call_id, function_name, function_args, function_result):
+            if not tool_call_id or not function_name or function_name.startswith("_"):
+                return
+
+            payload = {
+                "message_id": message_id,
+                "tool_call_id": tool_call_id,
+                "tool_name": function_name,
+            }
+
+            started = tool_started_at.pop(tool_call_id, None)
+            if started is not None:
+                payload["duration_s"] = round(time.monotonic() - started, 3)
+
+            preview = _tool_result_preview(function_result)
+            if preview:
+                payload["result_preview"] = preview
+
+            _enqueue("tool.completed", payload)
 
         async def _run_and_signal() -> None:
             try:
@@ -1601,6 +1650,8 @@ class APIServerAdapter(BasePlatformAdapter):
                     session_id=session_id,
                     stream_delta_callback=_delta,
                     tool_progress_callback=_tool_progress,
+                    tool_start_callback=_on_tool_start,
+                    tool_complete_callback=_on_tool_complete,
                     gateway_session_key=gateway_session_key,
                 )
                 final_response = result.get("final_response", "") if isinstance(result, dict) else ""
