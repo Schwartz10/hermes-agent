@@ -1,3 +1,4 @@
+from hermes_state import AsyncSessionDB
 """Tests for gateway /usage command — agent cache lookup and output fields."""
 
 import threading
@@ -76,20 +77,20 @@ class TestUsageCachedAgent:
         runner = _make_runner(SK, cached_agent=agent)
         event = MagicMock()
 
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=0.1234, status="estimated")
+        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"):
             result = await runner._handle_usage_command(event)
 
         assert "claude-sonnet-4.6" in result
         assert "35,000" in result  # input tokens
         assert "10,000" in result  # output tokens
-        assert "5,000" in result   # cache read
-        assert "2,000" in result   # cache write
         assert "50,000" in result  # total
-        assert "$0.1234" in result
         assert "30,000" in result  # context
         assert "Compressions: 1" in result
+        # Cost and cache-hit reporting is removed everywhere.
+        assert "$" not in result
+        assert "Cache read" not in result
+        assert "Cache write" not in result
+        assert "Cost" not in result
 
     @pytest.mark.asyncio
     async def test_running_agent_preferred_over_cache(self):
@@ -161,20 +162,6 @@ class TestUsageCachedAgent:
         assert "Cache read" not in result
         assert "Cache write" not in result
 
-    @pytest.mark.asyncio
-    async def test_cost_included_status(self):
-        """Subscription-included providers show 'included' instead of dollar amount."""
-        agent = _make_mock_agent(provider="openai-codex")
-        runner = _make_runner(SK, cached_agent=agent)
-        event = MagicMock()
-
-        with patch("agent.rate_limit_tracker.format_rate_limit_compact", return_value="RPM: 50/60"), \
-             patch("agent.usage_pricing.estimate_usage_cost") as mock_cost:
-            mock_cost.return_value = MagicMock(amount_usd=None, status="included")
-            result = await runner._handle_usage_command(event)
-
-        assert "Cost: included" in result
-
 
 class TestUsageAccountSection:
     """Account-limits section appended to /usage output (PR #2486)."""
@@ -211,8 +198,8 @@ class TestUsageAccountSection:
     @pytest.mark.asyncio
     async def test_usage_command_uses_persisted_provider_when_agent_not_running(self, monkeypatch):
         runner = _make_runner(SK)
-        runner._session_db = MagicMock()
-        runner._session_db.get_session.return_value = {
+        runner._session_db = AsyncSessionDB(MagicMock())
+        runner._session_db._db.get_session.return_value = {
             "billing_provider": "openai-codex",
             "billing_base_url": "https://chatgpt.com/backend-api/codex",
         }
