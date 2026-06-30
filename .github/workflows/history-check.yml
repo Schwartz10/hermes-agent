@@ -1,6 +1,6 @@
 name: History Check
 
-# Rejects PRs whose branch has no common ancestor with main.
+# Rejects PRs whose branch has no common ancestor with the target branch.
 #
 # In May 2026 PR #25045 was merged from a branch that had been disconnected
 # from main's history (likely an accidental `git checkout --orphan` or
@@ -11,7 +11,7 @@ name: History Check
 # onto that single commit.
 #
 # This check catches the failure mode by requiring `git merge-base` between
-# the PR head and main to be non-empty.
+# the PR head and target branch to be non-empty.
 
 on:
   workflow_call:
@@ -27,31 +27,33 @@ jobs:
         with:
           fetch-depth: 0 # full history both sides for merge-base
 
-      - name: Reject PRs with no common ancestor on main
+      - name: Reject PRs with no common ancestor on target branch
         run: |
+          TARGET_REF="${GITHUB_BASE_REF:-main}"
+          BASE_REF="origin/${TARGET_REF}"
           # `git merge-base` exits non-zero AND prints nothing when the two
           # commits share no ancestor.  We check both conditions explicitly
           # so the failure message is clear regardless of which signal fires
           # first.
-          if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
+          if ! BASE=$(git merge-base "$BASE_REF" HEAD 2>/dev/null) || [ -z "$BASE" ]; then
             echo ""
-            echo "::error::This PR has no common ancestor with main."
+            echo "::error::This PR has no common ancestor with ${TARGET_REF}."
             echo ""
-            echo "Your branch's history is disconnected from main.  Common causes:"
+            echo "Your branch's history is disconnected from ${TARGET_REF}.  Common causes:"
             echo "  - the branch was created with 'git checkout --orphan'"
             echo "  - '.git/' was re-initialized at some point during the work"
             echo "  - the branch was force-pushed from an unrelated repository"
             echo ""
             echo "Merging an unrelated-history PR grafts a parent-less root commit"
-            echo "into main and collapses git blame for every file in that snapshot."
+            echo "into the target branch and collapses git blame for every file in that snapshot."
             echo "Reference: PR #25045 caused this and re-rooted blame on ~1500"
             echo "files to a single orphan commit."
             echo ""
-            echo "To fix, rebase your changes onto current main:"
-            echo "  git fetch origin main"
-            echo "  git checkout -b fix-branch origin/main"
+            echo "To fix, rebase your changes onto current ${TARGET_REF}:"
+            echo "  git fetch origin ${TARGET_REF}"
+            echo "  git checkout -b fix-branch origin/${TARGET_REF}"
             echo "  # re-apply your changes (cherry-pick, copy files, etc.)"
             echo "  git push -f origin fix-branch"
             exit 1
           fi
-          echo "::notice::Common ancestor with main: $BASE"
+          echo "::notice::Common ancestor with ${TARGET_REF}: $BASE"
