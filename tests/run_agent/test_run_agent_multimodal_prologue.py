@@ -42,6 +42,15 @@ class TestSummarizeUserMessageForLog:
         assert "[1 image]" in summary
         assert "describe this" in summary
 
+    def test_list_with_audio(self):
+        content = [
+            {"type": "text", "text": "listen"},
+            {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+        ]
+        summary = _summarize_user_message_for_log(content)
+        assert "[1 audio]" in summary
+        assert "listen" in summary
+
     def test_list_with_multiple_images(self):
         content = [
             {"type": "text", "text": "compare these"},
@@ -93,10 +102,23 @@ class TestChatContentToResponsesParts:
             {"type": "input_image", "image_url": "https://x"},
         ]
 
+    def test_audio_parts_become_input_audio(self):
+        content = [
+            {"type": "text", "text": "ok"},
+            {"type": "audio", "audio_url": "data:audio/ogg;base64,ZmFrZQ=="},
+        ]
+        assert _chat_content_to_responses_parts(content) == [
+            {"type": "input_text", "text": "ok"},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "ZmFrZQ==", "format": "ogg"},
+            },
+        ]
+
     def test_unknown_parts_skipped(self):
         """Unknown types shouldn't crash — filtered silently at this level
         (the API server's normalizer rejects them earlier)."""
-        content = [{"type": "text", "text": "ok"}, {"type": "audio", "x": "y"}]
+        content = [{"type": "text", "text": "ok"}, {"type": "video", "x": "y"}]
         assert _chat_content_to_responses_parts(content) == [{"type": "input_text", "text": "ok"}]
 
     def test_empty_url_image_skipped(self):

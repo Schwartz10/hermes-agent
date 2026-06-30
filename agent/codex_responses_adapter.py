@@ -79,8 +79,8 @@ _TOOL_CALL_LEAK_PATTERN = re.compile(
 def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> List[Dict[str, Any]]:
     """Convert chat-style multimodal content to Responses API input parts.
 
-    Input:  ``[{"type":"text"|"image_url", ...}]`` (native OpenAI Chat format)
-    Output: ``[{"type":"input_text"|"output_text"|"input_image", ...}]`` (Responses format)
+    Input:  ``[{"type":"text"|"image_url"|"input_audio", ...}]`` (native OpenAI Chat format)
+    Output: ``[{"type":"input_text"|"output_text"|"input_image"|"input_audio", ...}]`` (Responses format)
 
     The ``role`` parameter controls the text content type:
     - ``"user"`` (default) → ``"input_text"``
@@ -124,13 +124,21 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
             if isinstance(detail, str) and detail.strip():
                 image_part["detail"] = detail.strip()
             converted.append(image_part)
+            continue
+        if ptype in {"input_audio", "audio"} and role != "assistant":
+            try:
+                from agent.audio_routing import normalize_input_audio_part
+
+                converted.append(normalize_input_audio_part(part, validate_data=False))
+            except Exception:
+                continue
     return converted
 
 
 def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
     """Flatten message content to a plain-text summary.
 
-    Multimodal messages arrive as a list of ``{type:"text"|"image_url", ...}``
+    Multimodal messages arrive as a list of ``{type:"text"|"image_url"|"input_audio", ...}``
     parts from the API server.  Several consumers want a plain string:
 
     - Logging, spinner previews, and trajectory files (the default ``sep=" "``).
@@ -150,6 +158,7 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
     if isinstance(content, list):
         text_bits: List[str] = []
         image_count = 0
+        audio_count = 0
         for part in content:
             if isinstance(part, str):
                 if part:
@@ -164,7 +173,12 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
                     text_bits.append(text)
             elif ptype in {"image_url", "input_image"}:
                 image_count += 1
+            elif ptype in {"input_audio", "audio"}:
+                audio_count += 1
         summary = sep.join(text_bits).strip()
+        if audio_count:
+            note = f"[{audio_count} audio{'s' if audio_count != 1 else ''}]"
+            summary = f"{note} {summary}" if summary else note
         if image_count:
             note = f"[{image_count} image{'s' if image_count != 1 else ''}]"
             summary = f"{note} {summary}" if summary else note
@@ -733,7 +747,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
             if isinstance(content, list):
                 # Multimodal content from ``_chat_messages_to_responses_input``
                 # is already in Responses format (``input_text`` / ``output_text``
-                # / ``input_image``).  Validate each part and pass through.
+                # / ``input_image`` / ``input_audio``).  Validate each part and pass through.
                 # Use the correct text type for the role — ``output_text`` for
                 # assistant messages, ``input_text`` for user messages.
                 text_type = "output_text" if role == "assistant" else "input_text"
@@ -767,6 +781,19 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                         if isinstance(detail, str) and detail.strip():
                             image_part["detail"] = detail.strip()
                         validated.append(image_part)
+                    elif ptype in {"input_audio", "audio"}:
+                        if role != "user":
+                            raise ValueError(
+                                f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."
+                            )
+                        try:
+                            from agent.audio_routing import normalize_input_audio_part
+
+                            validated.append(normalize_input_audio_part(part, validate_data=False))
+                        except Exception as exc:
+                            raise ValueError(
+                                f"Codex Responses input[{idx}].content[{part_idx}] has invalid audio: {exc}"
+                            ) from exc
                     else:
                         raise ValueError(
                             f"Codex Responses input[{idx}].content[{part_idx}] has unsupported type {part.get('type')!r}."

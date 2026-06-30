@@ -71,6 +71,39 @@ class TestNormalizeMultimodalContent:
         out = _normalize_multimodal_content(content)
         assert out == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
 
+    def test_input_audio_preserved_with_text(self):
+        content = [
+            {"type": "text", "text": "listen"},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "ZmFrZQ==", "format": "ogg", "mime_type": "audio/ogg"},
+            },
+        ]
+        out = _normalize_multimodal_content(content)
+        assert out == [
+            {"type": "text", "text": "listen"},
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "ZmFrZQ==", "format": "ogg"},
+            },
+        ]
+
+    def test_audio_data_url_accepted(self):
+        content = [{"type": "audio", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}]
+        out = _normalize_multimodal_content(content)
+        assert out == [
+            {
+                "type": "input_audio",
+                "input_audio": {"data": "ZmFrZQ==", "format": "wav"},
+            }
+        ]
+
+    def test_invalid_audio_base64_rejected(self):
+        content = [{"type": "input_audio", "input_audio": {"data": "not base64", "format": "ogg"}}]
+        with pytest.raises(ValueError) as exc:
+            _normalize_multimodal_content(content)
+        assert str(exc.value).startswith("invalid_audio:")
+
     def test_non_image_data_url_rejected(self):
         content = [{"type": "image_url", "image_url": {"url": "data:text/plain;base64,SGVsbG8="}}]
         with pytest.raises(ValueError) as exc:
@@ -99,7 +132,7 @@ class TestNormalizeMultimodalContent:
 
     def test_unknown_part_type_rejected(self):
         with pytest.raises(ValueError) as exc:
-            _normalize_multimodal_content([{"type": "audio", "audio": {}}])
+            _normalize_multimodal_content([{"type": "video", "video": {}}])
         assert str(exc.value).startswith("unsupported_content_type:")
 
 
@@ -112,6 +145,9 @@ class TestContentHasVisiblePayload:
 
     def test_list_with_image_only(self):
         assert _content_has_visible_payload([{"type": "image_url", "image_url": {"url": "x"}}])
+
+    def test_list_with_audio_only(self):
+        assert _content_has_visible_payload([{"type": "input_audio", "input_audio": {"data": "x"}}])
 
     def test_list_with_only_empty_text(self):
         assert not _content_has_visible_payload([{"type": "text", "text": ""}])

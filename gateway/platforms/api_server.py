@@ -202,6 +202,7 @@ def _normalize_chat_content(
 # rest of the agent pipeline already understands.
 _TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+_AUDIO_PART_TYPES = frozenset({"input_audio", "audio"})
 _FILE_PART_TYPES = frozenset({"file", "input_file"})
 
 
@@ -209,16 +210,17 @@ def _normalize_multimodal_content(content: Any) -> Any:
     """Validate and normalize multimodal content for the API server.
 
     Returns a plain string when the content is text-only, or a list of
-    ``{"type": "text"|"image_url", ...}`` parts when images are present.
+    ``{"type": "text"|"image_url"|"input_audio", ...}`` parts when media is present.
     The output shape is the native OpenAI Chat Completions vision format,
     which the agent pipeline accepts verbatim (OpenAI-wire providers) or
     converts (``_preprocess_anthropic_content`` for Anthropic).
 
     Raises ``ValueError`` with an OpenAI-style code on invalid input:
       * ``unsupported_content_type`` — file/input_file/file_id parts, or
-        non-image ``data:`` URLs.
+        non-image/non-audio ``data:`` URLs.
       * ``invalid_image_url`` — missing URL or unsupported scheme.
-      * ``invalid_content_part`` — malformed text/image objects.
+      * ``invalid_audio`` — malformed base64 audio payloads.
+      * ``invalid_content_part`` — malformed text/image/audio objects.
 
     Callers translate the ValueError into a 400 response.
     """
@@ -298,6 +300,17 @@ def _normalize_multimodal_content(content: Any) -> Any:
             normalized_parts.append(image_part)
             continue
 
+        if part_type in _AUDIO_PART_TYPES:
+            try:
+                from agent.audio_routing import normalize_input_audio_part
+
+                normalized_parts.append(normalize_input_audio_part(part, validate_data=True))
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise ValueError(f"invalid_audio:Invalid audio content part: {exc}") from exc
+            continue
+
         if part_type in _FILE_PART_TYPES:
             raise ValueError(
                 "unsupported_content_type:Inline image inputs are supported, "
@@ -308,7 +321,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text and image_url/input_image parts are supported."
+            "Only text, image_url/input_image, and input_audio parts are supported."
         )
 
     if not normalized_parts:
@@ -324,7 +337,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
 
 
 def _content_has_visible_payload(content: Any) -> bool:
-    """True when content has any text or image attachment.  Used to reject empty turns."""
+    """True when content has any text, image, or audio attachment.  Used to reject empty turns."""
     if isinstance(content, str):
         return bool(content.strip())
     if isinstance(content, list):
@@ -335,6 +348,8 @@ def _content_has_visible_payload(content: Any) -> bool:
                     return True
                 if ptype in _IMAGE_PART_TYPES:
                     return True
+                if ptype in _AUDIO_PART_TYPES:
+                    return True
     return False
 
 
@@ -344,9 +359,10 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     code, _, message = raw.partition(":")
     if not message:
         code, message = "invalid_content_part", raw
+    status = 413 if code == "audio_too_large" else 400
     return web.json_response(
         _openai_error(message, code=code, param=param),
-        status=400,
+        status=status,
     )
 
 
@@ -1221,6 +1237,16 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
+        try:
+            from agent.audio_routing import MAX_AUDIO_BYTES, SUPPORTED_AUDIO_FORMATS
+
+            audio_caps = {
+                "max_bytes": min(MAX_AUDIO_BYTES, (MAX_REQUEST_BYTES * 3) // 4),
+                "formats": list(SUPPORTED_AUDIO_FORMATS),
+            }
+        except Exception:
+            audio_caps = {"max_bytes": (MAX_REQUEST_BYTES * 3) // 4, "formats": []}
+
         return web.json_response({
             "object": "hermes.api_server.capabilities",
             "platform": "hermes-agent",
@@ -1259,12 +1285,13 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
                 "cors": bool(self._cors_origins),
             },
+            "audio": audio_caps,
             "endpoints": {
                 "health": {"method": "GET", "path": "/health"},
                 "health_detailed": {"method": "GET", "path": "/health/detailed"},
