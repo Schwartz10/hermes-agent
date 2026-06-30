@@ -173,7 +173,7 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
                     text_bits.append(text)
             elif ptype in {"image_url", "input_image"}:
                 image_count += 1
-            elif ptype in {"input_audio", "audio"}:
+            elif ptype == "input_audio":
                 audio_count += 1
         summary = sep.join(text_bits).strip()
         if audio_count:
