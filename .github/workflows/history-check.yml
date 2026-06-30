@@ -29,7 +29,7 @@ jobs:
 
       - name: Reject PRs with no common ancestor on target branch
         run: |
-          TARGET_REF="${GITHUB_BASE_REF:-main}"
+          TARGET_REF="${GITHUB_BASE_REF:-williamos/main}"
           BASE_REF="origin/${TARGET_REF}"
           # `git merge-base` exits non-zero AND prints nothing when the two
           # commits share no ancestor.  We check both conditions explicitly
