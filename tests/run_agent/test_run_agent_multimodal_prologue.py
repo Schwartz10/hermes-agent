@@ -51,6 +51,15 @@ class TestSummarizeUserMessageForLog:
         assert "[1 audio]" in summary
         assert "listen" in summary
 
+    def test_list_with_audio_alias(self):
+        content = [
+            {"type": "text", "text": "listen"},
+            {"type": "audio", "audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+        ]
+        summary = _summarize_user_message_for_log(content)
+        assert "[1 audio]" in summary
+        assert "ZmFrZQ==" not in summary
+
     def test_list_with_multiple_images(self):
         content = [
             {"type": "text", "text": "compare these"},

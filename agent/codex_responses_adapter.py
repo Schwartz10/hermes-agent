@@ -130,7 +130,8 @@ def _chat_content_to_responses_parts(content: Any, *, role: str = "user") -> Lis
                 from agent.audio_routing import normalize_input_audio_part
 
                 converted.append(normalize_input_audio_part(part, validate_data=False))
-            except Exception:
+            except ValueError as exc:
+                logger.debug("Skipping invalid audio part during Responses conversion: %s", exc)
                 continue
     return converted
 
@@ -173,7 +174,7 @@ def _summarize_user_message_for_log(content: Any, *, sep: str = " ") -> str:
                     text_bits.append(text)
             elif ptype in {"image_url", "input_image"}:
                 image_count += 1
-            elif ptype == "input_audio":
+            elif ptype in {"input_audio", "audio"}:
                 audio_count += 1
         summary = sep.join(text_bits).strip()
         if audio_count:
@@ -790,7 +791,7 @@ def _preflight_codex_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                             from agent.audio_routing import normalize_input_audio_part
 
                             validated.append(normalize_input_audio_part(part, validate_data=False))
-                        except Exception as exc:
+                        except ValueError as exc:
                             raise ValueError(
                                 f"Codex Responses input[{idx}].content[{part_idx}] has invalid audio: {exc}"
                             ) from exc

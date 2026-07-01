@@ -299,6 +299,29 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
 
 @pytest.mark.asyncio
+async def test_session_chat_rejects_unsupported_audio_before_run(auth_adapter, session_db):
+    session_id = session_db.create_session("audio-session", "api_server")
+    audio_payload = [
+        {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+    ]
+
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_active_model_supports_audio_input", return_value=False), \
+         patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": audio_payload},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            body = await resp.json()
+
+    assert resp.status == 400
+    assert body["error"]["code"] == "unsupported_audio_input"
+    mock_run.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
     session_id = session_db.create_session("image-stream-session", "api_server")
     image_payload = [
@@ -329,6 +352,28 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_rejects_unsupported_audio_before_sse(adapter, session_db):
+    session_id = session_db.create_session("audio-stream-session", "api_server")
+    audio_payload = [
+        {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+    ]
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_active_model_supports_audio_input", return_value=False), \
+         patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": audio_payload},
+            )
+            body = await resp.json()
+
+    assert resp.status == 400
+    assert body["error"]["code"] == "unsupported_audio_input"
+    mock_run.assert_not_called()
 
 
 @pytest.mark.asyncio

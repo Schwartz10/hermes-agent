@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -24,10 +25,13 @@ _MIME_TO_FORMAT = {
     "audio/ogg": "ogg",
     "audio/opus": "ogg",
     "audio/webm": "webm",
+    # Browser MediaRecorder audio captures commonly arrive as video/webm.
     "video/webm": "webm",
     "audio/flac": "flac",
     "audio/aac": "m4a",
 }
+
+logger = logging.getLogger(__name__)
 
 
 def _format_from_mime(mime_type: str) -> Optional[str]:
@@ -117,9 +121,47 @@ def content_has_audio_parts(content: Any) -> bool:
     )
 
 
+def lookup_supports_audio_input(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
+    """Return True/False for known native audio support, None when unknown."""
+    if isinstance(cfg, dict):
+        from agent.image_routing import _coerce_capability_bool
+
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        top = _coerce_capability_bool(model_cfg.get("supports_audio_input"))
+        if top is not None:
+            return top
+
+        providers_cfg = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        config_provider = str(model_cfg.get("provider") or "").strip()
+        for provider_key in dict.fromkeys(filter(None, (provider, config_provider))):
+            provider_cfg = providers_cfg.get(provider_key)
+            if not isinstance(provider_cfg, dict):
+                continue
+            models_cfg = provider_cfg.get("models")
+            if not isinstance(models_cfg, dict):
+                continue
+            per_model = models_cfg.get(model)
+            if isinstance(per_model, dict):
+                value = _coerce_capability_bool(per_model.get("supports_audio_input"))
+                if value is not None:
+                    return value
+
+    if not provider or not model:
+        return None
+    try:
+        from agent.models_dev import get_model_capabilities
+
+        caps = get_model_capabilities(provider, model)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("audio_routing: models.dev caps lookup failed for %s:%s: %s", provider, model, exc)
+        return None
+    return None if caps is None else bool(getattr(caps, "supports_audio_input", False))
+
+
 __all__ = [
     "MAX_AUDIO_BYTES",
     "SUPPORTED_AUDIO_FORMATS",
     "content_has_audio_parts",
+    "lookup_supports_audio_input",
     "normalize_input_audio_part",
 ]

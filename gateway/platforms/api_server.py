@@ -89,6 +89,8 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
+# Inline audio is base64 encoded inside JSON, so the effective decoded audio
+# ceiling is lower than this request-body cap.
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
@@ -351,6 +353,49 @@ def _content_has_visible_payload(content: Any) -> bool:
                 if ptype in _AUDIO_PART_TYPES:
                     return True
     return False
+
+
+def _content_has_audio_parts_deep(content: Any) -> bool:
+    if not isinstance(content, list):
+        return False
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = str(part.get("type") or "").strip().lower()
+        if ptype in _AUDIO_PART_TYPES:
+            return True
+        if "content" in part and _content_has_audio_parts_deep(part.get("content")):
+            return True
+    return False
+
+
+def _reject_non_user_audio_content(role: Any, content: Any, *, param: str) -> Optional["web.Response"]:
+    if str(role or "") == "user" or not _content_has_audio_parts_deep(content):
+        return None
+    return web.json_response(
+        _openai_error(
+            "Native audio input is only supported on user messages.",
+            code="unsupported_audio_input",
+            param=param,
+        ),
+        status=400,
+    )
+
+
+def _reject_non_user_audio_messages(messages: Any, *, param: str) -> Optional["web.Response"]:
+    if not isinstance(messages, list):
+        return None
+    for idx, msg in enumerate(messages):
+        if not isinstance(msg, dict):
+            continue
+        err = _reject_non_user_audio_content(
+            msg.get("role"),
+            msg.get("content"),
+            param=f"{param}[{idx}].content",
+        )
+        if err is not None:
+            return err
+    return None
 
 
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
@@ -1154,6 +1199,38 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return agent
 
+    def _active_model_supports_audio_input(self) -> bool:
+        try:
+            from agent.audio_routing import lookup_supports_audio_input
+            from gateway.run import (
+                _load_gateway_config,
+                _resolve_gateway_model,
+                _resolve_runtime_agent_kwargs,
+            )
+
+            cfg = _load_gateway_config()
+            runtime_kwargs = _resolve_runtime_agent_kwargs()
+            provider = str(runtime_kwargs.get("provider") or "").strip()
+            model = str(runtime_kwargs.get("model") or _resolve_gateway_model(cfg) or "").strip()
+            return lookup_supports_audio_input(provider, model, cfg) is True
+        except Exception as exc:
+            logger.debug("Could not resolve native audio capability: %s", exc)
+            return False
+
+    def _reject_unsupported_audio_content(self, content: Any, *, param: str) -> Optional["web.Response"]:
+        if not _content_has_audio_parts_deep(content):
+            return None
+        if self._active_model_supports_audio_input():
+            return None
+        return web.json_response(
+            _openai_error(
+                "Native audio input is not supported by the configured model/provider.",
+                code="unsupported_audio_input",
+                param=param,
+            ),
+            status=400,
+        )
+
     # ------------------------------------------------------------------
     # HTTP Handlers
     # ------------------------------------------------------------------
@@ -1241,11 +1318,20 @@ class APIServerAdapter(BasePlatformAdapter):
             from agent.audio_routing import MAX_AUDIO_BYTES, SUPPORTED_AUDIO_FORMATS
 
             audio_caps = {
+                "native_model": self._active_model_supports_audio_input(),
+                "fallback_transcription": False,
                 "max_bytes": min(MAX_AUDIO_BYTES, (MAX_REQUEST_BYTES * 3) // 4),
                 "formats": list(SUPPORTED_AUDIO_FORMATS),
+                "unsupported_error_code": "unsupported_audio_input",
             }
         except Exception:
-            audio_caps = {"max_bytes": (MAX_REQUEST_BYTES * 3) // 4, "formats": []}
+            audio_caps = {
+                "native_model": False,
+                "fallback_transcription": False,
+                "max_bytes": (MAX_REQUEST_BYTES * 3) // 4,
+                "formats": [],
+                "unsupported_error_code": "unsupported_audio_input",
+            }
 
         return web.json_response({
             "object": "hermes.api_server.capabilities",
@@ -1677,7 +1763,13 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        audio_err = self._reject_unsupported_audio_content(user_message, param="message")
+        if audio_err is not None:
+            return audio_err
         history = self._conversation_history_for_session(session_id)
+        audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
+        if audio_err is not None:
+            return audio_err
         result, usage = await self._run_agent(
             user_message=user_message,
             conversation_history=history,
@@ -1721,6 +1813,13 @@ class APIServerAdapter(BasePlatformAdapter):
         system_prompt = body.get("system_message") or body.get("instructions")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_message must be a string", code="invalid_system_message"), status=400)
+        audio_err = self._reject_unsupported_audio_content(user_message, param="message")
+        if audio_err is not None:
+            return audio_err
+        history = self._conversation_history_for_session(session_id)
+        audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
+        if audio_err is not None:
+            return audio_err
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
@@ -1799,7 +1898,6 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 await queue.put(_event_payload("run.started", {"user_message": {"role": "user", "content": user_message}}))
                 await queue.put(_event_payload("message.started", {"message": {"id": message_id, "role": "assistant"}}))
-                history = self._conversation_history_for_session(session_id)
                 result, usage = await self._run_agent(
                     user_message=user_message,
                     conversation_history=history,
@@ -1904,7 +2002,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Extract system message (becomes ephemeral system prompt layered ON TOP of core)
         system_prompt = None
-        conversation_messages: List[Dict[str, str]] = []
+        conversation_messages: List[Dict[str, Any]] = []
 
         for idx, msg in enumerate(messages):
             role = msg.get("role", "")
@@ -1922,6 +2020,9 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
+                audio_role_err = _reject_non_user_audio_content(role, content, param=f"messages[{idx}].content")
+                if audio_role_err is not None:
+                    return audio_role_err
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -1936,6 +2037,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 {"error": {"message": "No user message found in messages", "type": "invalid_request_error"}},
                 status=400,
             )
+        audio_err = self._reject_unsupported_audio_content(conversation_messages, param="messages")
+        if audio_err is not None:
+            return audio_err
 
         # Allow caller to scope long-term memory (e.g. Honcho) with a
         # stable per-channel identifier via X-Hermes-Session-Key.  This
@@ -1992,6 +2096,9 @@ class APIServerAdapter(BasePlatformAdapter):
             except Exception as e:
                 logger.warning("Failed to load session history for %s: %s", session_id, e)
                 history = []
+            audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
+            if audio_err is not None:
+                return audio_err
         else:
             # Derive a stable session ID from the conversation fingerprint so
             # that consecutive messages from the same Open WebUI (or similar)
@@ -3062,6 +3169,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         content = _normalize_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                    audio_role_err = _reject_non_user_audio_content(role, content, param=f"input[{idx}].content")
+                    if audio_role_err is not None:
+                        return audio_role_err
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -3088,7 +3198,15 @@ class APIServerAdapter(BasePlatformAdapter):
                     entry_content = _normalize_multimodal_content(entry["content"])
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
-                conversation_history.append({"role": str(entry["role"]), "content": entry_content})
+                entry_role = str(entry["role"])
+                audio_role_err = _reject_non_user_audio_content(
+                    entry_role,
+                    entry_content,
+                    param=f"conversation_history[{i}].content",
+                )
+                if audio_role_err is not None:
+                    return audio_role_err
+                conversation_history.append({"role": entry_role, "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -3102,6 +3220,12 @@ class APIServerAdapter(BasePlatformAdapter):
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
+            audio_role_err = _reject_non_user_audio_messages(conversation_history, param="previous_response_id")
+            if audio_role_err is not None:
+                return audio_role_err
+            audio_err = self._reject_unsupported_audio_content(conversation_history, param="previous_response_id")
+            if audio_err is not None:
+                return audio_err
 
         # Append new input messages to history (all but the last become history)
         for msg in input_messages[:-1]:
@@ -3111,6 +3235,12 @@ class APIServerAdapter(BasePlatformAdapter):
         user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
         if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
+        audio_err = self._reject_unsupported_audio_content(
+            conversation_history + [{"role": "user", "content": user_message}],
+            param="input",
+        )
+        if audio_err is not None:
+            return audio_err
 
         # Truncation support
         if body.get("truncation") == "auto" and len(conversation_history) > 100:
@@ -3826,8 +3956,8 @@ class APIServerAdapter(BasePlatformAdapter):
 
     async def _run_agent(
         self,
-        user_message: str,
-        conversation_history: List[Dict[str, str]],
+        user_message: Any,
+        conversation_history: List[Dict[str, Any]],
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
@@ -3991,8 +4121,28 @@ class APIServerAdapter(BasePlatformAdapter):
         if not raw_input:
             return web.json_response(_openai_error("Missing 'input' field"), status=400)
 
-        user_message = raw_input if isinstance(raw_input, str) else (raw_input[-1].get("content", "") if isinstance(raw_input, list) else "")
-        if not user_message:
+        input_messages: List[Dict[str, Any]] = []
+        if isinstance(raw_input, str):
+            input_messages = [{"role": "user", "content": raw_input}]
+        elif isinstance(raw_input, list):
+            for idx, item in enumerate(raw_input):
+                if isinstance(item, str):
+                    input_messages.append({"role": "user", "content": item})
+                elif isinstance(item, dict):
+                    role = item.get("role", "user")
+                    try:
+                        content = _normalize_multimodal_content(item.get("content", ""))
+                    except ValueError as exc:
+                        return _multimodal_validation_error(exc, param=f"input[{idx}].content")
+                    audio_role_err = _reject_non_user_audio_content(role, content, param=f"input[{idx}].content")
+                    if audio_role_err is not None:
+                        return audio_role_err
+                    input_messages.append({"role": role, "content": content})
+        else:
+            return web.json_response(_openai_error("'input' must be a string or array"), status=400)
+
+        user_message: Any = input_messages[-1].get("content", "") if input_messages else ""
+        if not _content_has_visible_payload(user_message):
             return web.json_response(_openai_error("No user message found in input"), status=400)
 
         instructions = body.get("instructions")
@@ -4000,7 +4150,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Accept explicit conversation_history from the request body.
         # Precedence: explicit conversation_history > previous_response_id.
-        conversation_history: List[Dict[str, str]] = []
+        conversation_history: List[Dict[str, Any]] = []
         raw_history = body.get("conversation_history")
         if raw_history:
             if not isinstance(raw_history, list):
@@ -4014,7 +4164,19 @@ class APIServerAdapter(BasePlatformAdapter):
                         _openai_error(f"conversation_history[{i}] must have 'role' and 'content' fields"),
                         status=400,
                     )
-                conversation_history.append({"role": str(entry["role"]), "content": str(entry["content"])})
+                try:
+                    entry_content = _normalize_multimodal_content(entry["content"])
+                except ValueError as exc:
+                    return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
+                entry_role = str(entry["role"])
+                audio_role_err = _reject_non_user_audio_content(
+                    entry_role,
+                    entry_content,
+                    param=f"conversation_history[{i}].content",
+                )
+                if audio_role_err is not None:
+                    return audio_role_err
+                conversation_history.append({"role": entry_role, "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
 
@@ -4026,21 +4188,25 @@ class APIServerAdapter(BasePlatformAdapter):
                 stored_session_id = stored.get("session_id")
                 if instructions is None:
                     instructions = stored.get("instructions")
+                audio_role_err = _reject_non_user_audio_messages(conversation_history, param="previous_response_id")
+                if audio_role_err is not None:
+                    return audio_role_err
+                audio_err = self._reject_unsupported_audio_content(conversation_history, param="previous_response_id")
+                if audio_err is not None:
+                    return audio_err
 
         # When input is a multi-message array, extract all but the last
         # message as conversation history (the last becomes user_message).
         # Only fires when no explicit history was provided.
-        if not conversation_history and isinstance(raw_input, list) and len(raw_input) > 1:
-            for msg in raw_input[:-1]:
-                if isinstance(msg, dict) and msg.get("role") and msg.get("content"):
-                    content = msg["content"]
-                    if isinstance(content, list):
-                        # Flatten multi-part content blocks to text
-                        content = " ".join(
-                            part.get("text", "") for part in content
-                            if isinstance(part, dict) and part.get("type") == "text"
-                        )
-                    conversation_history.append({"role": msg["role"], "content": str(content)})
+        if not conversation_history and len(input_messages) > 1:
+            conversation_history.extend(input_messages[:-1])
+
+        audio_err = self._reject_unsupported_audio_content(
+            conversation_history + [{"role": "user", "content": user_message}],
+            param="input",
+        )
+        if audio_err is not None:
+            return audio_err
 
         run_id = f"run_{uuid.uuid4().hex}"
         session_id = body.get("session_id") or stored_session_id or run_id
