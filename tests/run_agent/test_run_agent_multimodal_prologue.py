@@ -60,6 +60,13 @@ class TestSummarizeUserMessageForLog:
         assert "[1 audio]" in summary
         assert "ZmFrZQ==" not in summary
 
+    def test_invalid_audio_alias_skipped(self):
+        content = [
+            {"type": "audio", "data": "ZmFrZQ=="},
+            {"type": "text", "text": "listen"},
+        ]
+        assert _summarize_user_message_for_log(content) == "listen"
+
     def test_list_with_multiple_images(self):
         content = [
             {"type": "text", "text": "compare these"},

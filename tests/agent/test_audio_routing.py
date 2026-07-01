@@ -75,6 +75,16 @@ def test_lookup_supports_audio_input_provider_model_override():
     assert lookup_supports_audio_input("custom", "voice-model", cfg) is False
 
 
+def test_lookup_supports_audio_input_legacy_custom_provider_override():
+    cfg = {
+        "model": {"provider": "voice-shim"},
+        "custom_providers": [
+            {"name": "voice-shim", "models": {"voice-model": {"supports_audio_input": True}}},
+        ],
+    }
+    assert lookup_supports_audio_input("custom", "voice-model", cfg) is True
+
+
 def test_lookup_supports_audio_input_models_dev_fallback():
     fake_caps = type("Caps", (), {"supports_audio_input": True})()
     with patch("agent.models_dev.get_model_capabilities", return_value=fake_caps):

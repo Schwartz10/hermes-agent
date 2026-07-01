@@ -356,16 +356,19 @@ def _content_has_visible_payload(content: Any) -> bool:
 
 
 def _content_has_audio_parts_deep(content: Any) -> bool:
-    if not isinstance(content, list):
-        return False
-    for part in content:
-        if not isinstance(part, dict):
+    stack = [content]
+    while stack:
+        current = stack.pop()
+        if not isinstance(current, list):
             continue
-        ptype = str(part.get("type") or "").strip().lower()
-        if ptype in _AUDIO_PART_TYPES:
-            return True
-        if "content" in part and _content_has_audio_parts_deep(part.get("content")):
-            return True
+        for part in current:
+            if not isinstance(part, dict):
+                continue
+            ptype = str(part.get("type") or "").strip().lower()
+            if ptype in _AUDIO_PART_TYPES:
+                return True
+            if "content" in part:
+                stack.append(part.get("content"))
     return False
 
 

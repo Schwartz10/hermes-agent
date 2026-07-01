@@ -16,6 +16,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    _content_has_audio_parts_deep,
     _content_has_visible_payload,
     _normalize_multimodal_content,
     cors_middleware,
@@ -151,6 +152,15 @@ class TestContentHasVisiblePayload:
 
     def test_list_with_only_empty_text(self):
         assert not _content_has_visible_payload([{"type": "text", "text": ""}])
+
+
+class TestContentHasAudioPartsDeep:
+    def test_deeply_nested_audio_scan_is_iterative(self):
+        content = [{"role": "user", "content": [{"type": "input_audio"}]}]
+        for _ in range(1500):
+            content = [{"role": "user", "content": content}]
+
+        assert _content_has_audio_parts_deep(content)
 
 
 # ---------------------------------------------------------------------------

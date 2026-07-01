@@ -146,6 +146,28 @@ def lookup_supports_audio_input(provider: str, model: str, cfg: Optional[Dict[st
                 if value is not None:
                     return value
 
+        custom_providers = cfg.get("custom_providers")
+        if isinstance(custom_providers, list):
+            candidate_names = set()
+            for provider_key in filter(None, (provider, config_provider)):
+                candidate_names.add(provider_key)
+                if provider_key.startswith("custom:"):
+                    candidate_names.add(provider_key[len("custom:"):])
+                else:
+                    candidate_names.add(f"custom:{provider_key}")
+            for entry in custom_providers:
+                if not isinstance(entry, dict):
+                    continue
+                entry_name = str(entry.get("name") or "").strip()
+                if entry_name not in candidate_names:
+                    continue
+                models_cfg = entry.get("models") if isinstance(entry.get("models"), dict) else {}
+                per_model = models_cfg.get(model)
+                if isinstance(per_model, dict):
+                    value = _coerce_capability_bool(per_model.get("supports_audio_input"))
+                    if value is not None:
+                        return value
+
     if not provider or not model:
         return None
     try:
