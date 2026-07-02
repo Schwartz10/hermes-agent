@@ -306,8 +306,7 @@ async def test_session_chat_rejects_unsupported_audio_before_run(auth_adapter, s
     ]
 
     app = _create_session_app(auth_adapter)
-    with patch.object(auth_adapter, "_active_model_supports_audio_input", return_value=False), \
-         patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+    with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat",
@@ -318,6 +317,7 @@ async def test_session_chat_rejects_unsupported_audio_before_run(auth_adapter, s
 
     assert resp.status == 400
     assert body["error"]["code"] == "unsupported_audio_input"
+    assert "/v1/audio/transcriptions" in body["error"]["message"]
     mock_run.assert_not_called()
 
 
@@ -362,8 +362,7 @@ async def test_session_chat_stream_rejects_unsupported_audio_before_sse(adapter,
     ]
 
     app = _create_session_app(adapter)
-    with patch.object(adapter, "_active_model_supports_audio_input", return_value=False), \
-         patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
+    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
         async with TestClient(TestServer(app)) as cli:
             resp = await cli.post(
                 f"/api/sessions/{session_id}/chat/stream",
@@ -373,6 +372,7 @@ async def test_session_chat_stream_rejects_unsupported_audio_before_sse(adapter,
 
     assert resp.status == 400
     assert body["error"]["code"] == "unsupported_audio_input"
+    assert "/v1/audio/transcriptions" in body["error"]["message"]
     mock_run.assert_not_called()
 
 

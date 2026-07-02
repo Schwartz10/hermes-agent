@@ -72,7 +72,7 @@ class TestNormalizeMultimodalContent:
         out = _normalize_multimodal_content(content)
         assert out == [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]
 
-    def test_input_audio_preserved_with_text(self):
+    def test_input_audio_rejected_with_text(self):
         content = [
             {"type": "text", "text": "listen"},
             {
@@ -80,30 +80,22 @@ class TestNormalizeMultimodalContent:
                 "input_audio": {"data": "ZmFrZQ==", "format": "ogg", "mime_type": "audio/ogg"},
             },
         ]
-        out = _normalize_multimodal_content(content)
-        assert out == [
-            {"type": "text", "text": "listen"},
-            {
-                "type": "input_audio",
-                "input_audio": {"data": "ZmFrZQ==", "format": "ogg"},
-            },
-        ]
+        with pytest.raises(ValueError) as exc:
+            _normalize_multimodal_content(content)
+        assert str(exc.value).startswith("unsupported_audio_input:")
+        assert "/v1/audio/transcriptions" in str(exc.value)
 
-    def test_audio_data_url_accepted(self):
+    def test_audio_data_url_rejected(self):
         content = [{"type": "audio", "audio_url": "data:audio/wav;base64,ZmFrZQ=="}]
-        out = _normalize_multimodal_content(content)
-        assert out == [
-            {
-                "type": "input_audio",
-                "input_audio": {"data": "ZmFrZQ==", "format": "wav"},
-            }
-        ]
+        with pytest.raises(ValueError) as exc:
+            _normalize_multimodal_content(content)
+        assert str(exc.value).startswith("unsupported_audio_input:")
 
-    def test_invalid_audio_base64_rejected(self):
+    def test_invalid_audio_base64_still_rejected_as_raw_audio(self):
         content = [{"type": "input_audio", "input_audio": {"data": "not base64", "format": "ogg"}}]
         with pytest.raises(ValueError) as exc:
             _normalize_multimodal_content(content)
-        assert str(exc.value).startswith("invalid_audio:")
+        assert str(exc.value).startswith("unsupported_audio_input:")
 
     def test_non_image_data_url_rejected(self):
         content = [{"type": "image_url", "image_url": {"url": "data:text/plain;base64,SGVsbG8="}}]
@@ -223,7 +215,7 @@ class TestChatCompletionsMultimodalHTTP:
             assert mock_run.captured["user_message"] == image_payload
 
     @pytest.mark.asyncio
-    async def test_input_audio_preserved_to_run_agent_when_supported(self, adapter):
+    async def test_input_audio_rejected_before_run_agent(self, adapter):
         audio_payload = [
             {"type": "text", "text": "listen"},
             {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
@@ -231,16 +223,7 @@ class TestChatCompletionsMultimodalHTTP:
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=True), \
-                 patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
-                async def _stub(**kwargs):
-                    mock_run.captured = kwargs
-                    return (
-                        {"final_response": "heard it", "messages": [], "api_calls": 1},
-                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                    )
-                mock_run.side_effect = _stub
-
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -249,15 +232,18 @@ class TestChatCompletionsMultimodalHTTP:
                     },
                 )
 
-        assert resp.status == 200, await resp.text()
-        assert mock_run.captured["user_message"] == audio_payload
+                body = await resp.json()
+
+        assert resp.status == 400
+        assert body["error"]["code"] == "unsupported_audio_input"
+        assert "/v1/audio/transcriptions" in body["error"]["message"]
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_input_audio_rejected_when_unsupported(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=False), \
-                 patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
                 resp = await cli.post(
                     "/v1/chat/completions",
                     json={
@@ -276,32 +262,31 @@ class TestChatCompletionsMultimodalHTTP:
 
         assert resp.status == 400
         assert body["error"]["code"] == "unsupported_audio_input"
-        assert "configured model/provider" in body["error"]["message"]
+        assert "/v1/audio/transcriptions" in body["error"]["message"]
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_malformed_audio_returns_validation_error_before_capability_check(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=False):
-                resp = await cli.post(
-                    "/v1/chat/completions",
-                    json={
-                        "model": "hermes-agent",
-                        "messages": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_audio", "input_audio": {"data": "not base64", "format": "ogg"}},
-                                ],
-                            }
-                        ],
-                    },
-                )
-                body = await resp.json()
+            resp = await cli.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "hermes-agent",
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_audio", "input_audio": {"data": "not base64", "format": "ogg"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+            body = await resp.json()
 
         assert resp.status == 400
-        assert body["error"]["code"] == "invalid_audio"
+        assert body["error"]["code"] == "unsupported_audio_input"
 
     @pytest.mark.asyncio
     async def test_text_only_array_collapses_to_string(self, adapter):
@@ -415,19 +400,10 @@ class TestResponsesMultimodalHTTP:
             assert mock_run.captured["user_message"] == expected
 
     @pytest.mark.asyncio
-    async def test_input_audio_forwarded_when_supported(self, adapter):
+    async def test_input_audio_rejected_before_responses_run_agent(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=True), \
-                 patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
-                async def _stub(**kwargs):
-                    mock_run.captured = kwargs
-                    return (
-                        {"final_response": "ok", "messages": [], "api_calls": 1},
-                        {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                    )
-                mock_run.side_effect = _stub
-
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
                 resp = await cli.post(
                     "/v1/responses",
                     json={
@@ -443,19 +419,18 @@ class TestResponsesMultimodalHTTP:
                         ],
                     },
                 )
+                body = await resp.json()
 
-        assert resp.status == 200, await resp.text()
-        assert mock_run.captured["user_message"] == [
-            {"type": "text", "text": "Listen."},
-            {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
-        ]
+        assert resp.status == 400
+        assert body["error"]["code"] == "unsupported_audio_input"
+        assert "/v1/audio/transcriptions" in body["error"]["message"]
+        mock_run.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_input_audio_rejected_when_unsupported(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=False), \
-                 patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
                 resp = await cli.post(
                     "/v1/responses",
                     json={
@@ -500,22 +475,21 @@ class TestResponsesMultimodalHTTP:
     async def test_assistant_role_audio_rejected_in_preflight(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=True):
-                resp = await cli.post(
-                    "/v1/responses",
-                    json={
-                        "model": "hermes-agent",
-                        "input": [
-                            {
-                                "role": "assistant",
-                                "content": [
-                                    {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
-                                ],
-                            }
-                        ],
-                    },
-                )
-                body = await resp.json()
+            resp = await cli.post(
+                "/v1/responses",
+                json={
+                    "model": "hermes-agent",
+                    "input": [
+                        {
+                            "role": "assistant",
+                            "content": [
+                                {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+            body = await resp.json()
 
         assert resp.status == 400
         assert body["error"]["code"] == "unsupported_audio_input"
@@ -540,8 +514,7 @@ class TestResponsesMultimodalHTTP:
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=True), \
-                 patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
+            with patch.object(adapter, "_run_agent", new=MagicMock()) as mock_run:
                 resp = await cli.post(
                     "/v1/responses",
                     json={"previous_response_id": "resp_prev", "input": "next"},
@@ -550,5 +523,5 @@ class TestResponsesMultimodalHTTP:
 
         assert resp.status == 400
         assert body["error"]["code"] == "unsupported_audio_input"
-        assert body["error"]["param"] == "previous_response_id[0].content"
+        assert body["error"]["param"] == "previous_response_id"
         mock_run.assert_not_called()

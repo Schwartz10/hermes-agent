@@ -332,12 +332,6 @@ CAPS_REGISTRY = {
                 "modalities": {"input": ["text"]},
                 "limit": {"context": 128000, "output": 8192},
             },
-            "audio-capable": {
-                "id": "audio-capable",
-                "tool_call": True,
-                "modalities": {"input": ["text", "audio"]},
-                "limit": {"context": 128000, "output": 8192},
-            },
         },
     },
     "anthropic": {
@@ -371,13 +365,6 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("google", "gemma-4-31b-it")
         assert caps is not None
         assert caps.supports_vision is True
-        assert caps.supports_audio_input is False
-
-    def test_audio_from_modalities_input_audio(self):
-        with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("google", "audio-capable")
-        assert caps is not None
-        assert caps.supports_audio_input is True
 
     def test_text_only_modalities_override_stale_attachment_flag(self):
         """Text-only modalities must win over stale attachment=True metadata."""
@@ -385,7 +372,6 @@ class TestGetModelCapabilities:
             caps = get_model_capabilities("google", "text-only-with-stale-attachment")
         assert caps is not None
         assert caps.supports_vision is False
-        assert caps.supports_audio_input is False
 
     def test_no_vision_without_attachment_or_modalities(self):
         """Models with neither attachment nor image modality should be non-vision."""
@@ -418,5 +404,5 @@ class TestGetModelCapabilities:
 
     def test_provider_not_found_returns_none(self):
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("nonexistent-provider", "audio-capable")
+            caps = get_model_capabilities("nonexistent-provider", "gemma-4-31b-it")
         assert caps is None

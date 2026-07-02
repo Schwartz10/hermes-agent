@@ -404,7 +404,6 @@ class ModelCapabilities:
 
     supports_tools: bool = True
     supports_vision: bool = False
-    supports_audio_input: bool = False
     supports_reasoning: bool = False
     context_window: int = 200000
     max_output_tokens: int = 8192
@@ -483,10 +482,8 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     if isinstance(input_mods, list):
         input_mod_values = {str(mod).strip().lower() for mod in input_mods}
         supports_vision = "image" in input_mod_values
-        supports_audio_input = "audio" in input_mod_values
     else:
         supports_vision = bool(entry.get("attachment", False))
-        supports_audio_input = False
     supports_reasoning = bool(entry.get("reasoning", False))
 
     # Extract limits
@@ -505,7 +502,6 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     return ModelCapabilities(
         supports_tools=supports_tools,
         supports_vision=supports_vision,
-        supports_audio_input=supports_audio_input,
         supports_reasoning=supports_reasoning,
         context_window=context_window,
         max_output_tokens=max_output_tokens,

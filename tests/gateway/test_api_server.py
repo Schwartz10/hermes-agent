@@ -534,6 +534,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/v1/audio/transcriptions", adapter._handle_audio_transcriptions)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_post("/v1/runs", adapter._handle_runs)
@@ -800,47 +801,33 @@ class TestCapabilitiesEndpoint:
             assert data["features"]["run_status"] is True
             assert data["features"]["run_events_sse"] is True
             assert data["features"]["audio_api"] is True
+            assert data["audio"]["transcription"] is True
             assert data["audio"]["native_model"] is False
-            assert data["audio"]["fallback_transcription"] is False
-            assert data["audio"]["max_bytes"] > 0
+            assert data["audio"]["max_bytes"] == 26214400
             assert "ogg" in data["audio"]["formats"]
-            assert data["audio"]["unsupported_error_code"] == "unsupported_audio_input"
             assert data["features"]["session_continuity_header"] == "X-Hermes-Session-Id"
             assert data["endpoints"]["run_status"]["path"] == "/v1/runs/{run_id}"
+            assert data["endpoints"]["audio_transcriptions"] == {
+                "method": "POST",
+                "path": "/v1/audio/transcriptions",
+            }
             assert data["endpoints"]["skills"] == {"method": "GET", "path": "/v1/skills"}
             assert data["endpoints"]["toolsets"] == {"method": "GET", "path": "/v1/toolsets"}
 
     @pytest.mark.asyncio
-    async def test_capabilities_reports_native_audio_when_runtime_model_supports_it(self, adapter):
+    async def test_capabilities_never_reports_native_audio_from_runtime(self, adapter):
         app = _create_app(adapter)
         with patch("gateway.run._load_gateway_config", return_value={}), \
              patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "openai"}), \
-             patch("gateway.run._resolve_gateway_model", return_value="gpt-audio"), \
-             patch("agent.audio_routing.lookup_supports_audio_input", return_value=True):
+             patch("gateway.run._resolve_gateway_model", return_value="gpt-audio"):
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/v1/capabilities")
                 assert resp.status == 200
                 data = await resp.json()
 
         assert data["features"]["audio_api"] is True
-        assert data["audio"]["native_model"] is True
-        assert data["audio"]["fallback_transcription"] is False
-
-    @pytest.mark.asyncio
-    async def test_capabilities_reports_no_native_audio_when_unknown(self, adapter):
-        app = _create_app(adapter)
-        with patch("gateway.run._load_gateway_config", return_value={}), \
-             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"provider": "custom"}), \
-             patch("gateway.run._resolve_gateway_model", return_value="unknown"), \
-             patch("agent.audio_routing.lookup_supports_audio_input", return_value=None):
-            async with TestClient(TestServer(app)) as cli:
-                resp = await cli.get("/v1/capabilities")
-                assert resp.status == 200
-                data = await resp.json()
-
-        assert data["features"]["audio_api"] is True
+        assert data["audio"]["transcription"] is True
         assert data["audio"]["native_model"] is False
-        assert data["audio"]["fallback_transcription"] is False
 
     @pytest.mark.asyncio
     async def test_capabilities_requires_auth_when_key_configured(self, auth_adapter):
@@ -868,21 +855,20 @@ class TestRunsAudioPreflight:
     async def test_runs_rejects_unsupported_audio_before_run_state(self, adapter):
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=False):
-                resp = await cli.post(
-                    "/v1/runs",
-                    json={
-                        "input": [
-                            {
-                                "role": "user",
-                                "content": [
-                                    {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
-                                ],
-                            }
-                        ],
-                    },
-                )
-                data = await resp.json()
+            resp = await cli.post(
+                "/v1/runs",
+                json={
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
+                            ],
+                        }
+                    ],
+                },
+            )
+            data = await resp.json()
 
         assert resp.status == 400
         assert data["error"]["code"] == "unsupported_audio_input"
@@ -909,16 +895,15 @@ class TestRunsAudioPreflight:
 
         app = _create_app(adapter)
         async with TestClient(TestServer(app)) as cli:
-            with patch.object(adapter, "_active_model_supports_audio_input", return_value=True):
-                resp = await cli.post(
-                    "/v1/runs",
-                    json={"previous_response_id": "resp_prev", "input": "next"},
-                )
-                data = await resp.json()
+            resp = await cli.post(
+                "/v1/runs",
+                json={"previous_response_id": "resp_prev", "input": "next"},
+            )
+            data = await resp.json()
 
         assert resp.status == 400
         assert data["error"]["code"] == "unsupported_audio_input"
-        assert data["error"]["param"] == "previous_response_id[0].content"
+        assert data["error"]["param"] == "previous_response_id"
         assert adapter._run_streams == {}
         assert adapter._run_statuses == {}
 

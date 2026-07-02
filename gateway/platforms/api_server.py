@@ -4,6 +4,7 @@ OpenAI-compatible API server platform adapter.
 Exposes an HTTP server with endpoints:
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
+- POST /v1/audio/transcriptions    — STT utility endpoint; does not create or mutate chat sessions
 - GET  /v1/responses/{response_id} — Retrieve a stored response
 - DELETE /v1/responses/{response_id} — Delete a stored response
 - GET  /v1/models                  — lists hermes-agent as an available model
@@ -46,10 +47,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from aiohttp import web
+    from aiohttp import ClientSession, ClientTimeout, FormData, web
     AIOHTTP_AVAILABLE = True
 except ImportError:
     AIOHTTP_AVAILABLE = False
+    ClientSession = None  # type: ignore[assignment]
+    ClientTimeout = None  # type: ignore[assignment]
+    FormData = None  # type: ignore[assignment]
     web = None  # type: ignore[assignment]
 
 from gateway.config import Platform, PlatformConfig
@@ -89,12 +93,33 @@ def _hermes_version() -> str:
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
 MAX_STORED_RESPONSES = 100
-# Inline audio is base64 encoded inside JSON, so the effective decoded audio
-# ceiling is lower than this request-body cap.
 MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversations with tool calls
+AUDIO_TRANSCRIPTION_MAX_BYTES = 25 * 1024 * 1024
+# Multipart bodies include field framing and headers in addition to the audio
+# bytes. The handler enforces AUDIO_TRANSCRIPTION_MAX_BYTES on the file itself.
+AUDIO_TRANSCRIPTION_REQUEST_MAX_BYTES = AUDIO_TRANSCRIPTION_MAX_BYTES + 1_048_576
+AUDIO_TRANSCRIPTION_FORMATS = ("wav", "mp3", "mp4", "mpeg", "mpga", "m4a", "ogg", "webm", "flac")
+AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS = 120
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+
+_AUDIO_TRANSCRIPTION_MIME_TO_FORMAT = {
+    "audio/wav": "wav",
+    "audio/wave": "wav",
+    "audio/x-wav": "wav",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/mp4": "mp4",
+    "audio/x-m4a": "m4a",
+    "audio/mpga": "mpga",
+    "audio/ogg": "ogg",
+    "audio/opus": "ogg",
+    "audio/webm": "webm",
+    "video/webm": "webm",
+    "audio/flac": "flac",
+    "audio/aac": "m4a",
+}
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -212,17 +237,17 @@ def _normalize_multimodal_content(content: Any) -> Any:
     """Validate and normalize multimodal content for the API server.
 
     Returns a plain string when the content is text-only, or a list of
-    ``{"type": "text"|"image_url"|"input_audio", ...}`` parts when media is present.
+    ``{"type": "text"|"image_url", ...}`` parts when images are present.
     The output shape is the native OpenAI Chat Completions vision format,
     which the agent pipeline accepts verbatim (OpenAI-wire providers) or
     converts (``_preprocess_anthropic_content`` for Anthropic).
 
     Raises ``ValueError`` with an OpenAI-style code on invalid input:
       * ``unsupported_content_type`` — file/input_file/file_id parts, or
-        non-image/non-audio ``data:`` URLs.
+        non-image ``data:`` URLs.
       * ``invalid_image_url`` — missing URL or unsupported scheme.
-      * ``invalid_audio`` — malformed base64 audio payloads.
-      * ``invalid_content_part`` — malformed text/image/audio objects.
+      * ``unsupported_audio_input`` — raw audio parts sent to chat/session APIs.
+      * ``invalid_content_part`` — malformed text/image objects.
 
     Callers translate the ValueError into a 400 response.
     """
@@ -303,15 +328,10 @@ def _normalize_multimodal_content(content: Any) -> Any:
             continue
 
         if part_type in _AUDIO_PART_TYPES:
-            try:
-                from agent.audio_routing import normalize_input_audio_part
-
-                normalized_parts.append(normalize_input_audio_part(part, validate_data=True))
-            except ValueError:
-                raise
-            except Exception as exc:
-                raise ValueError(f"invalid_audio:Invalid audio content part: {exc}") from exc
-            continue
+            raise ValueError(
+                "unsupported_audio_input:Audio input must be transcribed first with "
+                "/v1/audio/transcriptions, then sent to chat as text."
+            )
 
         if part_type in _FILE_PART_TYPES:
             raise ValueError(
@@ -323,7 +343,7 @@ def _normalize_multimodal_content(content: Any) -> Any:
         # instead of a silently dropped turn.
         raise ValueError(
             f"unsupported_content_type:Unsupported content part type {raw_type!r}. "
-            "Only text, image_url/input_image, and input_audio parts are supported."
+            "Only text and image_url/input_image parts are supported."
         )
 
     if not normalized_parts:
@@ -372,35 +392,6 @@ def _content_has_audio_parts_deep(content: Any) -> bool:
     return False
 
 
-def _reject_non_user_audio_content(role: Any, content: Any, *, param: str) -> Optional["web.Response"]:
-    if str(role or "") == "user" or not _content_has_audio_parts_deep(content):
-        return None
-    return web.json_response(
-        _openai_error(
-            "Native audio input is only supported on user messages.",
-            code="unsupported_audio_input",
-            param=param,
-        ),
-        status=400,
-    )
-
-
-def _reject_non_user_audio_messages(messages: Any, *, param: str) -> Optional["web.Response"]:
-    if not isinstance(messages, list):
-        return None
-    for idx, msg in enumerate(messages):
-        if not isinstance(msg, dict):
-            continue
-        err = _reject_non_user_audio_content(
-            msg.get("role"),
-            msg.get("content"),
-            param=f"{param}[{idx}].content",
-        )
-        if err is not None:
-            return err
-    return None
-
-
 def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Response":
     """Translate a ``_normalize_multimodal_content`` ValueError into a 400 response."""
     raw = str(exc)
@@ -426,6 +417,31 @@ def _session_chat_user_message(body: Dict[str, Any], *, param: str = "message") 
         return _normalize_multimodal_content(user_message), None
     except ValueError as exc:
         return None, _multimodal_validation_error(exc, param=param)
+
+
+def _audio_format_from_mime(content_type: str) -> Optional[str]:
+    return _AUDIO_TRANSCRIPTION_MIME_TO_FORMAT.get(str(content_type or "").split(";", 1)[0].strip().lower())
+
+
+def _audio_format_for_upload(filename: str, content_type: str) -> Optional[str]:
+    suffix = Path(str(filename or "")).suffix.lower().lstrip(".")
+    if suffix in AUDIO_TRANSCRIPTION_FORMATS:
+        return suffix
+    return _audio_format_from_mime(content_type)
+
+
+def _transcription_upstream_url(base_url: str) -> str:
+    return f"{str(base_url or '').strip().rstrip('/')}/audio/transcriptions"
+
+
+def _extract_transcription_text(payload: Any) -> str:
+    if isinstance(payload, dict):
+        value = payload.get("text")
+        if isinstance(value, str):
+            return value.strip()
+    if isinstance(payload, str):
+        return payload.strip()
+    return ""
 
 
 def check_api_server_requirements() -> bool:
@@ -664,7 +680,12 @@ if AIOHTTP_AVAILABLE:
             cl = request.headers.get("Content-Length")
             if cl is not None:
                 try:
-                    if int(cl) > MAX_REQUEST_BYTES:
+                    limit = (
+                        AUDIO_TRANSCRIPTION_REQUEST_MAX_BYTES
+                        if request.path == "/v1/audio/transcriptions"
+                        else MAX_REQUEST_BYTES
+                    )
+                    if int(cl) > limit:
                         return web.json_response(_openai_error("Request body too large.", code="body_too_large"), status=413)
                 except ValueError:
                     return web.json_response(_openai_error("Invalid Content-Length header.", code="invalid_content_length"), status=400)
@@ -1202,36 +1223,283 @@ class APIServerAdapter(BasePlatformAdapter):
         )
         return agent
 
-    def _active_model_supports_audio_input(self) -> bool:
-        try:
-            from agent.audio_routing import lookup_supports_audio_input
-            from gateway.run import (
-                _load_gateway_config,
-                _resolve_gateway_model,
-                _resolve_runtime_agent_kwargs,
-            )
-
-            cfg = _load_gateway_config()
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-            provider = str(runtime_kwargs.get("provider") or "").strip()
-            model = str(runtime_kwargs.get("model") or _resolve_gateway_model(cfg) or "").strip()
-            return lookup_supports_audio_input(provider, model, cfg) is True
-        except Exception as exc:
-            logger.debug("Could not resolve native audio capability: %s", exc)
-            return False
-
     def _reject_unsupported_audio_content(self, content: Any, *, param: str) -> Optional["web.Response"]:
         if not _content_has_audio_parts_deep(content):
             return None
-        if self._active_model_supports_audio_input():
-            return None
         return web.json_response(
             _openai_error(
-                "Native audio input is not supported by the configured model/provider.",
+                "Audio input must be transcribed first with /v1/audio/transcriptions, "
+                "then sent to chat as text.",
                 code="unsupported_audio_input",
                 param=param,
             ),
             status=400,
+        )
+
+    def _resolve_audio_transcription_runtime(self) -> tuple[Optional[Dict[str, str]], Optional["web.Response"]]:
+        try:
+            from hermes_cli.runtime_provider import resolve_requested_provider, resolve_runtime_provider
+
+            requested_provider = resolve_requested_provider()
+        except Exception as exc:
+            return None, web.json_response(
+                _openai_error(
+                    f"Could not resolve runtime provider for audio transcription: {exc}",
+                    code="provider_config_error",
+                ),
+                status=503,
+            )
+
+        provider = str(requested_provider or "").strip().lower()
+        if provider == "openai-codex":
+            try:
+                from hermes_cli.auth import AuthError, resolve_codex_runtime_credentials
+
+                creds = resolve_codex_runtime_credentials()
+            except AuthError as exc:
+                code = exc.code or "codex_auth_required"
+                status = 429 if "rate" in code or "limit" in code or "quota" in code else 401
+                return None, web.json_response(
+                    _openai_error(
+                        str(exc),
+                        err_type="authentication_error",
+                        code=code,
+                    ),
+                    status=status,
+                )
+            except Exception as exc:
+                return None, web.json_response(
+                    _openai_error(
+                        f"Could not resolve Codex credentials for audio transcription: {exc}",
+                        err_type="authentication_error",
+                        code="codex_auth_error",
+                    ),
+                    status=401,
+                )
+            runtime_kwargs = {
+                "provider": "openai-codex",
+                "base_url": creds.get("base_url"),
+                "api_key": creds.get("api_key"),
+            }
+        else:
+            try:
+                runtime_kwargs = resolve_runtime_provider(requested=requested_provider)
+            except Exception as exc:
+                return None, web.json_response(
+                    _openai_error(
+                        f"Could not resolve runtime provider for audio transcription: {exc}",
+                        code="provider_config_error",
+                    ),
+                    status=503,
+                )
+
+        base_url = str(runtime_kwargs.get("base_url") or "").strip().rstrip("/")
+        api_key = str(runtime_kwargs.get("api_key") or "").strip()
+        provider = str(runtime_kwargs.get("provider") or provider or "").strip()
+        if not provider or not base_url or not api_key:
+            return None, web.json_response(
+                _openai_error(
+                    "Audio transcription requires a configured runtime provider, base_url, and API key.",
+                    code="provider_config_error",
+                ),
+                status=503,
+            )
+
+        return {"provider": provider, "base_url": base_url, "api_key": api_key}, None
+
+    async def _post_audio_transcription(
+        self,
+        *,
+        runtime: Dict[str, str],
+        model: str,
+        filename: str,
+        content_type: str,
+        data: bytes,
+    ) -> tuple[Optional[str], Optional["web.Response"]]:
+        if ClientSession is None or ClientTimeout is None or FormData is None:
+            return None, web.json_response(
+                _openai_error("aiohttp is required for audio transcription.", code="missing_dependency"),
+                status=500,
+            )
+
+        provider = runtime["provider"]
+        api_key = runtime["api_key"]
+        headers = {"Authorization": f"Bearer {api_key}"}
+        if provider == "openai-codex":
+            try:
+                from agent.auxiliary_client import _codex_cloudflare_headers
+
+                headers.update(_codex_cloudflare_headers(api_key))
+            except Exception:
+                pass
+
+        form = FormData()
+        form.add_field("model", model)
+        form.add_field(
+            "file",
+            data,
+            filename=filename or "audio",
+            content_type=content_type or "application/octet-stream",
+        )
+
+        url = _transcription_upstream_url(runtime["base_url"])
+        timeout = ClientTimeout(total=AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS)
+        try:
+            async with ClientSession(timeout=timeout) as session:
+                async with session.post(url, data=form, headers=headers) as resp:
+                    raw_body = await resp.text()
+                    try:
+                        payload = json.loads(raw_body) if raw_body else {}
+                    except json.JSONDecodeError:
+                        payload = raw_body
+
+                    if resp.status >= 400:
+                        message = raw_body or f"Upstream transcription request failed with HTTP {resp.status}."
+                        if isinstance(payload, dict):
+                            err = payload.get("error")
+                            if isinstance(err, dict):
+                                message = err.get("message") or message
+                            elif isinstance(err, str):
+                                message = err
+                        status = resp.status if resp.status in {400, 401, 403, 404, 413, 429} else 502
+                        return None, web.json_response(
+                            _openai_error(
+                                f"Upstream transcription failed: {message}",
+                                err_type="server_error",
+                                code="upstream_transcription_failed",
+                            ),
+                            status=status,
+                        )
+
+                    transcript = _extract_transcription_text(payload)
+                    if not transcript:
+                        return None, web.json_response(
+                            _openai_error(
+                                "Transcription response did not include text.",
+                                err_type="server_error",
+                                code="invalid_transcription_response",
+                            ),
+                            status=502,
+                        )
+                    return transcript, None
+        except asyncio.TimeoutError:
+            return None, web.json_response(
+                _openai_error(
+                    "Upstream transcription timed out.",
+                    err_type="server_error",
+                    code="upstream_transcription_timeout",
+                ),
+                status=504,
+            )
+        except Exception as exc:
+            logger.debug("Audio transcription upstream request failed", exc_info=True)
+            return None, web.json_response(
+                _openai_error(
+                    f"Upstream transcription request failed: {exc}",
+                    err_type="server_error",
+                    code="upstream_transcription_failed",
+                ),
+                status=502,
+            )
+
+    async def _handle_audio_transcriptions(self, request: "web.Request") -> "web.Response":
+        """POST /v1/audio/transcriptions — utility STT endpoint."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        if not str(request.content_type or "").lower().startswith("multipart/"):
+            return web.json_response(
+                _openai_error("Expected multipart/form-data.", code="invalid_content_type"),
+                status=400,
+            )
+
+        model = ""
+        file_bytes: Optional[bytes] = None
+        filename = ""
+        content_type = ""
+
+        try:
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name == "model":
+                    model = (await part.text()).strip()
+                    continue
+                if part.name != "file":
+                    continue
+
+                filename = str(part.filename or "").strip() or "audio"
+                content_type = str(part.headers.get("Content-Type") or getattr(part, "content_type", "") or "").strip()
+                if _audio_format_for_upload(filename, content_type) is None:
+                    return web.json_response(
+                        _openai_error(
+                            "Unsupported audio format. Supported formats: "
+                            + ", ".join(AUDIO_TRANSCRIPTION_FORMATS),
+                            code="unsupported_content_type",
+                            param="file",
+                        ),
+                        status=400,
+                    )
+
+                chunks = bytearray()
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    chunks.extend(chunk)
+                    if len(chunks) > AUDIO_TRANSCRIPTION_MAX_BYTES:
+                        return web.json_response(
+                            _openai_error(
+                                f"Audio file exceeds {AUDIO_TRANSCRIPTION_MAX_BYTES} bytes.",
+                                code="audio_too_large",
+                                param="file",
+                            ),
+                            status=413,
+                        )
+                file_bytes = bytes(chunks)
+        except Exception as exc:
+            return web.json_response(
+                _openai_error(f"Invalid multipart request: {exc}", code="invalid_multipart"),
+                status=400,
+            )
+
+        if not model:
+            return web.json_response(
+                _openai_error("Missing required multipart field 'model'.", code="missing_model", param="model"),
+                status=400,
+            )
+        if file_bytes is None:
+            return web.json_response(
+                _openai_error("Missing required multipart file field 'file'.", code="missing_file", param="file"),
+                status=400,
+            )
+        if not file_bytes:
+            return web.json_response(
+                _openai_error("Audio file is empty.", code="invalid_audio", param="file"),
+                status=400,
+            )
+
+        runtime, runtime_err = self._resolve_audio_transcription_runtime()
+        if runtime_err is not None:
+            return runtime_err
+        assert runtime is not None
+
+        transcript, upstream_err = await self._post_audio_transcription(
+            runtime=runtime,
+            model=model,
+            filename=filename,
+            content_type=content_type,
+            data=file_bytes,
+        )
+        if upstream_err is not None:
+            return upstream_err
+
+        return web.json_response(
+            {
+                "text": transcript or "",
+                "model": model,
+                "provider": runtime["provider"],
+            }
         )
 
     # ------------------------------------------------------------------
@@ -1317,24 +1585,12 @@ class APIServerAdapter(BasePlatformAdapter):
         if auth_err:
             return auth_err
 
-        try:
-            from agent.audio_routing import MAX_AUDIO_BYTES, SUPPORTED_AUDIO_FORMATS
-
-            audio_caps = {
-                "native_model": self._active_model_supports_audio_input(),
-                "fallback_transcription": False,
-                "max_bytes": min(MAX_AUDIO_BYTES, (MAX_REQUEST_BYTES * 3) // 4),
-                "formats": list(SUPPORTED_AUDIO_FORMATS),
-                "unsupported_error_code": "unsupported_audio_input",
-            }
-        except Exception:
-            audio_caps = {
-                "native_model": False,
-                "fallback_transcription": False,
-                "max_bytes": (MAX_REQUEST_BYTES * 3) // 4,
-                "formats": [],
-                "unsupported_error_code": "unsupported_audio_input",
-            }
+        audio_caps = {
+            "transcription": True,
+            "native_model": False,
+            "max_bytes": AUDIO_TRANSCRIPTION_MAX_BYTES,
+            "formats": list(AUDIO_TRANSCRIPTION_FORMATS),
+        }
 
         return web.json_response({
             "object": "hermes.api_server.capabilities",
@@ -1388,6 +1644,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
+                "audio_transcriptions": {"method": "POST", "path": "/v1/audio/transcriptions"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
@@ -2023,9 +2280,6 @@ class APIServerAdapter(BasePlatformAdapter):
                     content = _normalize_multimodal_content(raw_content)
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"messages[{idx}].content")
-                audio_role_err = _reject_non_user_audio_content(role, content, param=f"messages[{idx}].content")
-                if audio_role_err is not None:
-                    return audio_role_err
                 conversation_messages.append({"role": role, "content": content})
 
         # Extract the last user message as the primary input
@@ -3172,9 +3426,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         content = _normalize_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
-                    audio_role_err = _reject_non_user_audio_content(role, content, param=f"input[{idx}].content")
-                    if audio_role_err is not None:
-                        return audio_role_err
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -3202,13 +3453,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
                 entry_role = str(entry["role"])
-                audio_role_err = _reject_non_user_audio_content(
-                    entry_role,
-                    entry_content,
-                    param=f"conversation_history[{i}].content",
-                )
-                if audio_role_err is not None:
-                    return audio_role_err
                 conversation_history.append({"role": entry_role, "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
@@ -3223,9 +3467,6 @@ class APIServerAdapter(BasePlatformAdapter):
             # If no instructions provided, carry forward from previous
             if instructions is None:
                 instructions = stored.get("instructions")
-            audio_role_err = _reject_non_user_audio_messages(conversation_history, param="previous_response_id")
-            if audio_role_err is not None:
-                return audio_role_err
             audio_err = self._reject_unsupported_audio_content(conversation_history, param="previous_response_id")
             if audio_err is not None:
                 return audio_err
@@ -4137,9 +4378,6 @@ class APIServerAdapter(BasePlatformAdapter):
                         content = _normalize_multimodal_content(item.get("content", ""))
                     except ValueError as exc:
                         return _multimodal_validation_error(exc, param=f"input[{idx}].content")
-                    audio_role_err = _reject_non_user_audio_content(role, content, param=f"input[{idx}].content")
-                    if audio_role_err is not None:
-                        return audio_role_err
                     input_messages.append({"role": role, "content": content})
         else:
             return web.json_response(_openai_error("'input' must be a string or array"), status=400)
@@ -4172,13 +4410,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 except ValueError as exc:
                     return _multimodal_validation_error(exc, param=f"conversation_history[{i}].content")
                 entry_role = str(entry["role"])
-                audio_role_err = _reject_non_user_audio_content(
-                    entry_role,
-                    entry_content,
-                    param=f"conversation_history[{i}].content",
-                )
-                if audio_role_err is not None:
-                    return audio_role_err
                 conversation_history.append({"role": entry_role, "content": entry_content})
             if previous_response_id:
                 logger.debug("Both conversation_history and previous_response_id provided; using conversation_history")
@@ -4191,9 +4422,6 @@ class APIServerAdapter(BasePlatformAdapter):
                 stored_session_id = stored.get("session_id")
                 if instructions is None:
                     instructions = stored.get("instructions")
-                audio_role_err = _reject_non_user_audio_messages(conversation_history, param="previous_response_id")
-                if audio_role_err is not None:
-                    return audio_role_err
                 audio_err = self._reject_unsupported_audio_content(conversation_history, param="previous_response_id")
                 if audio_err is not None:
                     return audio_err
@@ -4676,7 +4904,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
+            self._app = web.Application(middlewares=mws, client_max_size=AUDIO_TRANSCRIPTION_REQUEST_MAX_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)
@@ -4685,6 +4913,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_post("/v1/audio/transcriptions", self._handle_audio_transcriptions)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
