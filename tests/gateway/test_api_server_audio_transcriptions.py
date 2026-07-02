@@ -218,6 +218,31 @@ async def test_codex_auth_error_does_not_use_runtime_fallback():
 
 
 @pytest.mark.asyncio
+async def test_auto_codex_auth_error_does_not_use_runtime_fallback():
+    adapter = _make_adapter()
+    app = _create_app(adapter)
+    auth_error = AuthError(
+        "No Codex credentials stored.",
+        provider="openai-codex",
+        code="codex_auth_missing",
+        relogin_required=True,
+    )
+    with (
+        patch("hermes_cli.runtime_provider.resolve_requested_provider", return_value="auto"),
+        patch("hermes_cli.runtime_provider.resolve_runtime_provider", side_effect=auth_error) as mock_runtime,
+        patch.object(adapter, "_post_audio_transcription", new_callable=AsyncMock) as mock_post,
+    ):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/audio/transcriptions", data=_multipart())
+            body = await resp.json()
+
+    assert resp.status == 401
+    assert body["error"]["code"] == "codex_auth_missing"
+    mock_runtime.assert_called_once_with(requested="auto", allow_auto_codex_fallback=False)
+    mock_post.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_missing_custom_runtime_credentials_returns_config_error():
     adapter = _make_adapter()
     app = _create_app(adapter)

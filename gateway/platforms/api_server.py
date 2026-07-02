@@ -398,10 +398,9 @@ def _multimodal_validation_error(exc: ValueError, *, param: str) -> "web.Respons
     code, _, message = raw.partition(":")
     if not message:
         code, message = "invalid_content_part", raw
-    status = 413 if code == "audio_too_large" else 400
     return web.json_response(
         _openai_error(message, code=code, param=param),
-        status=status,
+        status=400,
     )
 
 
@@ -670,6 +669,19 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
             "code": code,
         }
     }
+
+
+def _codex_audio_auth_error_response(exc: Any) -> "web.Response":
+    code = getattr(exc, "code", None) or "codex_auth_required"
+    status = 429 if "rate" in code or "limit" in code or "quota" in code else 401
+    return web.json_response(
+        _openai_error(
+            str(exc),
+            err_type="authentication_error",
+            code=code,
+        ),
+        status=status,
+    )
 
 
 if AIOHTTP_AVAILABLE:
@@ -1238,6 +1250,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _resolve_audio_transcription_runtime(self) -> tuple[Optional[Dict[str, str]], Optional["web.Response"]]:
         try:
+            from hermes_cli.auth import AuthError
             from hermes_cli.runtime_provider import resolve_requested_provider, resolve_runtime_provider
 
             requested_provider = resolve_requested_provider()
@@ -1253,20 +1266,11 @@ class APIServerAdapter(BasePlatformAdapter):
         provider = str(requested_provider or "").strip().lower()
         if provider == "openai-codex":
             try:
-                from hermes_cli.auth import AuthError, resolve_codex_runtime_credentials
+                from hermes_cli.auth import resolve_codex_runtime_credentials
 
                 creds = resolve_codex_runtime_credentials()
             except AuthError as exc:
-                code = exc.code or "codex_auth_required"
-                status = 429 if "rate" in code or "limit" in code or "quota" in code else 401
-                return None, web.json_response(
-                    _openai_error(
-                        str(exc),
-                        err_type="authentication_error",
-                        code=code,
-                    ),
-                    status=status,
-                )
+                return None, _codex_audio_auth_error_response(exc)
             except Exception as exc:
                 return None, web.json_response(
                     _openai_error(
@@ -1283,7 +1287,23 @@ class APIServerAdapter(BasePlatformAdapter):
             }
         else:
             try:
-                runtime_kwargs = resolve_runtime_provider(requested=requested_provider)
+                runtime_kwargs = resolve_runtime_provider(
+                    requested=requested_provider,
+                    allow_auto_codex_fallback=False,
+                )
+            except AuthError as exc:
+                if (
+                    getattr(exc, "provider", None) == "openai-codex"
+                    or str(getattr(exc, "code", "") or "").startswith("codex_")
+                ):
+                    return None, _codex_audio_auth_error_response(exc)
+                return None, web.json_response(
+                    _openai_error(
+                        f"Could not resolve runtime provider for audio transcription: {exc}",
+                        code="provider_config_error",
+                    ),
+                    status=503,
+                )
             except Exception as exc:
                 return None, web.json_response(
                     _openai_error(
@@ -1413,6 +1433,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error("Expected multipart/form-data.", code="invalid_content_type"),
                 status=400,
             )
+
+        request = request.clone(client_max_size=AUDIO_TRANSCRIPTION_REQUEST_MAX_BYTES)
 
         model = ""
         file_bytes: Optional[bytes] = None
@@ -4904,7 +4926,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         try:
             mws = [mw for mw in (cors_middleware, body_limit_middleware, security_headers_middleware) if mw is not None]
-            self._app = web.Application(middlewares=mws, client_max_size=AUDIO_TRANSCRIPTION_REQUEST_MAX_BYTES)
+            self._app = web.Application(middlewares=mws, client_max_size=MAX_REQUEST_BYTES)
             assert self._app is not None
             self._app.router.add_get("/health", self._handle_health)
             self._app.router.add_get("/health/detailed", self._handle_health_detailed)

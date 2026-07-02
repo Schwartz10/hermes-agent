@@ -1431,6 +1431,7 @@ def resolve_runtime_provider(
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
     target_model: Optional[str] = None,
+    allow_auto_codex_fallback: bool = True,
 ) -> Dict[str, Any]:
     """Resolve runtime provider credentials for agent execution.
 
@@ -1441,6 +1442,11 @@ def resolve_runtime_provider(
     api_mode is derived from the model they are switching TO, not the stale
     persisted default. Other callers can leave it None to preserve existing
     behavior (api_mode derived from config).
+
+    allow_auto_codex_fallback: When False, an auto-detected Codex provider with
+    invalid credentials raises instead of falling through to another provider.
+    The normal chat path keeps the historical fallback behavior; utility
+    endpoints that must stay inside the Codex auth boundary can opt out.
     """
     requested_provider = resolve_requested_provider(requested)
 
@@ -1662,7 +1668,7 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
         except AuthError:
-            if requested_provider != "auto":
+            if requested_provider != "auto" or not allow_auto_codex_fallback:
                 raise
             # Auto-detected Codex but credentials are stale/revoked —
             # fall through to env-var providers (e.g. OpenRouter).
