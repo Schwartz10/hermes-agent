@@ -433,6 +433,19 @@ def _transcription_upstream_url(base_url: str) -> str:
     return f"{str(base_url or '').strip().rstrip('/')}/audio/transcriptions"
 
 
+def _codex_transcription_upstream_url(base_url: str) -> str:
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        normalized = "https://chatgpt.com/backend-api/codex"
+    if normalized.endswith("/transcribe"):
+        return normalized
+    if normalized.endswith("/codex"):
+        normalized = normalized[: -len("/codex")]
+    if normalized.endswith("/backend-api"):
+        return normalized + "/transcribe"
+    return normalized + "/backend-api/transcribe"
+
+
 def _extract_transcription_text(payload: Any) -> str:
     if isinstance(payload, dict):
         value = payload.get("text")
@@ -441,6 +454,47 @@ def _extract_transcription_text(payload: Any) -> str:
     if isinstance(payload, str):
         return payload.strip()
     return ""
+
+
+def _transcription_error_message_from_payload(payload: Any, fallback: str) -> str:
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            if isinstance(message, str) and message.strip():
+                return message.strip()
+        elif isinstance(err, str) and err.strip():
+            return err.strip()
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return fallback
+
+
+def _redact_codex_transcription_error_text(value: Any, *, limit: int = 500) -> str:
+    text = _redact_api_error_text(value)
+    text = re.sub(
+        r"(?i)[\"']?\basset_pointer\b[\"']?\s*[:=]\s*[\"']?[^,}\s\"']+[\"']?",
+        "asset metadata [redacted]",
+        text,
+    )
+    text = re.sub(r"(?i)\basset_pointer\b", "asset metadata", text)
+    text = re.sub(r"\bptr_[A-Za-z0-9._:-]+", "[redacted-asset-pointer]", text)
+    return text[:limit]
+
+
+def _codex_transcription_error_message(status: int, payload: Any, raw_body: str) -> str:
+    if status == 403:
+        return "ChatGPT transcription rejected request."
+
+    fallback = f"ChatGPT transcription request failed with HTTP {status}."
+    if isinstance(payload, dict):
+        message = _transcription_error_message_from_payload(payload, "")
+        if message:
+            return f"ChatGPT transcription request failed: {_redact_codex_transcription_error_text(message)}"
+        return fallback
+
+    return fallback
 
 
 def check_api_server_requirements() -> bool:
@@ -1349,12 +1403,25 @@ class APIServerAdapter(BasePlatformAdapter):
             try:
                 from agent.auxiliary_client import _codex_cloudflare_headers
 
+                headers.update({
+                    "Accept": "application/json",
+                    "Origin": "https://chatgpt.com",
+                    "Referer": "https://chatgpt.com/",
+                })
                 headers.update(_codex_cloudflare_headers(api_key))
-            except Exception:
-                pass
+            except Exception as exc:
+                return None, web.json_response(
+                    _openai_error(
+                        f"Could not build Codex transcription headers: {exc}",
+                        err_type="server_error",
+                        code="codex_transcription_header_error",
+                    ),
+                    status=500,
+                )
 
         form = FormData()
-        form.add_field("model", model)
+        if provider != "openai-codex":
+            form.add_field("model", model)
         form.add_field(
             "file",
             data,
@@ -1362,7 +1429,11 @@ class APIServerAdapter(BasePlatformAdapter):
             content_type=content_type or "application/octet-stream",
         )
 
-        url = _transcription_upstream_url(runtime["base_url"])
+        url = (
+            _codex_transcription_upstream_url(runtime["base_url"])
+            if provider == "openai-codex"
+            else _transcription_upstream_url(runtime["base_url"])
+        )
         timeout = ClientTimeout(total=AUDIO_TRANSCRIPTION_TIMEOUT_SECONDS)
         try:
             async with ClientSession(timeout=timeout) as session:
@@ -1374,17 +1445,20 @@ class APIServerAdapter(BasePlatformAdapter):
                         payload = raw_body
 
                     if resp.status >= 400:
-                        message = raw_body or f"Upstream transcription request failed with HTTP {resp.status}."
-                        if isinstance(payload, dict):
-                            err = payload.get("error")
-                            if isinstance(err, dict):
-                                message = err.get("message") or message
-                            elif isinstance(err, str):
-                                message = err
+                        if provider == "openai-codex":
+                            message = _codex_transcription_error_message(resp.status, payload, raw_body)
+                        else:
+                            fallback = raw_body or f"Upstream transcription request failed with HTTP {resp.status}."
+                            message = _transcription_error_message_from_payload(payload, fallback)
                         status = resp.status if resp.status in {400, 401, 403, 404, 413, 429} else 502
+                        error_message = (
+                            message
+                            if provider == "openai-codex"
+                            else f"Upstream transcription failed: {message}"
+                        )
                         return None, web.json_response(
                             _openai_error(
-                                f"Upstream transcription failed: {message}",
+                                error_message,
                                 err_type="server_error",
                                 code="upstream_transcription_failed",
                             ),

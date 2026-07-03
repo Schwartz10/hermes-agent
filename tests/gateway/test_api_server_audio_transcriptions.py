@@ -1,5 +1,7 @@
 """Tests for the API-server STT utility endpoint."""
 
+import base64
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -40,6 +42,76 @@ def _multipart(
     return form
 
 
+def _jwt_with_account_id(account_id: str) -> str:
+    def encode(payload):
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "none"}),
+            encode({"https://api.openai.com/auth": {"chatgpt_account_id": account_id}}),
+            "signature",
+        )
+    )
+
+
+class _FakeFormData:
+    def __init__(self):
+        self.fields = []
+
+    def add_field(self, name, value, **kwargs):
+        self.fields.append({"name": name, "value": value, **kwargs})
+
+
+def _install_fake_upstream(monkeypatch, *, status: int = 200, body: str = '{"text":"hello"}') -> dict:
+    captured = {}
+
+    class FakeResponse:
+        def __init__(self):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        async def text(self):
+            return body
+
+    class FakeClientSession:
+        def __init__(self, *, timeout=None, **_kwargs):
+            captured["timeout"] = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return None
+
+        def post(self, url, *, data=None, headers=None):
+            captured["url"] = url
+            captured["fields"] = list(getattr(data, "fields", []))
+            captured["headers"] = dict(headers or {})
+            return FakeResponse()
+
+    monkeypatch.setattr(api_server_mod, "ClientSession", FakeClientSession)
+    monkeypatch.setattr(api_server_mod, "FormData", _FakeFormData)
+    return captured
+
+
+def test_codex_transcription_url_uses_backend_api_sibling():
+    assert (
+        api_server_mod._codex_transcription_upstream_url("https://chatgpt.com/backend-api/codex")
+        == "https://chatgpt.com/backend-api/transcribe"
+    )
+    assert (
+        api_server_mod._codex_transcription_upstream_url("https://chatgpt.example/backend-api/codex")
+        == "https://chatgpt.example/backend-api/transcribe"
+    )
+
+
 @pytest.mark.asyncio
 async def test_transcription_succeeds_with_codex_auth():
     adapter = _make_adapter()
@@ -78,6 +150,106 @@ async def test_transcription_succeeds_with_codex_auth():
     assert captured["data"] == b"fake-audio"
     mock_run.assert_not_called()
     assert adapter._session_db is None
+
+
+@pytest.mark.asyncio
+async def test_post_audio_transcription_uses_codex_transcribe_request(monkeypatch):
+    adapter = _make_adapter()
+    captured = _install_fake_upstream(monkeypatch, body='{"text":"hello"}')
+    token = _jwt_with_account_id("acct_123")
+
+    transcript, err = await adapter._post_audio_transcription(
+        runtime={
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": token,
+        },
+        model="should-not-forward",
+        filename="voice.ogg",
+        content_type="audio/ogg",
+        data=b"fake-audio",
+    )
+
+    assert err is None
+    assert transcript == "hello"
+    assert captured["url"] == "https://chatgpt.com/backend-api/transcribe"
+    assert captured["headers"]["Authorization"] == f"Bearer {token}"
+    assert captured["headers"]["Accept"] == "application/json"
+    assert captured["headers"]["Origin"] == "https://chatgpt.com"
+    assert captured["headers"]["Referer"] == "https://chatgpt.com/"
+    assert captured["headers"]["originator"] == "codex_cli_rs"
+    assert captured["headers"]["ChatGPT-Account-ID"] == "acct_123"
+    assert [field["name"] for field in captured["fields"]] == ["file"]
+    assert captured["fields"][0]["filename"] == "voice.ogg"
+    assert captured["fields"][0]["content_type"] == "audio/ogg"
+    assert captured["fields"][0]["value"] == b"fake-audio"
+
+
+@pytest.mark.asyncio
+async def test_codex_transcription_403_html_error_is_sanitized(monkeypatch):
+    adapter = _make_adapter()
+    token = _jwt_with_account_id("acct_123")
+    captured = _install_fake_upstream(
+        monkeypatch,
+        status=403,
+        body="<html><body>cf challenge super-secret-token asset_pointer ptr_123</body></html>",
+    )
+
+    transcript, err = await adapter._post_audio_transcription(
+        runtime={
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": token,
+        },
+        model="should-not-forward",
+        filename="voice.ogg",
+        content_type="audio/ogg",
+        data=b"fake-audio",
+    )
+
+    assert transcript is None
+    assert err is not None
+    assert err.status == 403
+    body = json.loads(err.text)
+    message = body["error"]["message"]
+    assert message == "ChatGPT transcription rejected request."
+    assert "super-secret-token" not in message
+    assert "asset_pointer" not in message
+    assert "<html" not in message
+    assert captured["headers"]["Authorization"] == f"Bearer {token}"
+
+
+@pytest.mark.asyncio
+async def test_codex_transcription_structured_error_redacts_sensitive_fields(monkeypatch):
+    adapter = _make_adapter()
+    token = _jwt_with_account_id("acct_123")
+    _install_fake_upstream(
+        monkeypatch,
+        status=500,
+        body=json.dumps({"error": {"message": f"failed for asset_pointer ptr_123 using {token}"}}),
+    )
+
+    transcript, err = await adapter._post_audio_transcription(
+        runtime={
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": token,
+        },
+        model="should-not-forward",
+        filename="voice.ogg",
+        content_type="audio/ogg",
+        data=b"fake-audio",
+    )
+
+    assert transcript is None
+    assert err is not None
+    assert err.status == 502
+    body = json.loads(err.text)
+    message = body["error"]["message"]
+    assert message.startswith("ChatGPT transcription request failed:")
+    assert "asset_pointer" not in message
+    assert "ptr_123" not in message
+    assert token not in message
 
 
 @pytest.mark.asyncio
