@@ -14,6 +14,7 @@ Exposes an HTTP server with endpoints:
 - GET/PATCH/DELETE /api/sessions/{session_id} — read/update/delete a session
 - GET  /api/sessions/{session_id}/messages — read session message history
 - POST /api/sessions/{session_id}/fork — branch a session using SessionDB lineage
+- POST /api/sessions/{session_id}/steer — steer the currently active session run
 - POST /api/sessions/{session_id}/chat[/stream] — chat with a persisted session
 - POST /v1/runs                    — start a run, returns run_id immediately (202)
 - GET  /v1/runs/{run_id}           — retrieve current run status
@@ -1051,6 +1052,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Number of in-flight runs on the non-streaming chat/responses paths
         # (the /v1/runs path tracks its own in-flight set via _run_streams).
         self._inflight_agent_runs: int = 0
+        # API session_id -> active HTTP session-run metadata. This is only a
+        # bridge from the inherited active-session guard to the current
+        # AIAgent so /api/sessions/{id}/steer can reach AIAgent.steer().
+        self._api_session_runs: Dict[str, Dict[str, Any]] = {}
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -1966,6 +1971,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_chat": True,
                 "session_chat_streaming": True,
                 "session_fork": True,
+                "session_busy_handling": True,
+                "session_steer": True,
                 "admin_config_rw": False,
                 "jobs_admin": False,
                 "memory_write_api": False,
@@ -1998,6 +2005,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_delete": {"method": "DELETE", "path": "/api/sessions/{session_id}"},
                 "session_messages": {"method": "GET", "path": "/api/sessions/{session_id}/messages"},
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
+                "session_steer": {"method": "POST", "path": "/api/sessions/{session_id}/steer"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
             },
@@ -2158,6 +2166,85 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
+
+    def _session_busy_response(self, session_id: str) -> "web.Response":
+        active = self._api_session_runs.get(session_id) or {}
+        active_run_id = active.get("run_id")
+        if not active_run_id:
+            guard = self._active_sessions.get(session_id)
+            active_run_id = getattr(guard, "_hermes_api_run_id", None)
+        payload = _openai_error(
+            "Session is already running",
+            err_type="session_busy",
+            code="session_busy",
+        )
+        payload.update({
+            "session_id": session_id,
+            "active_run_id": active_run_id,
+            "accepted_behaviors": ["steer", "reject"],
+        })
+        return web.json_response(payload, status=409, headers={"Retry-After": "1"})
+
+    def _claim_api_session_run(
+        self,
+        session_id: str,
+        run_id: str,
+        *,
+        route: str,
+    ) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
+        """Claim the inherited active-session guard for one API session turn."""
+        self._heal_stale_session_lock(session_id)
+        if session_id not in self._active_sessions:
+            self._api_session_runs.pop(session_id, None)
+        if session_id in self._active_sessions:
+            return None, self._session_busy_response(session_id)
+
+        guard = asyncio.Event()
+        try:
+            setattr(guard, "_hermes_api_run_id", run_id)
+            setattr(guard, "_hermes_api_route", route)
+        except Exception:
+            pass
+        task = asyncio.current_task()
+        agent_ref: list[Any] = [None]
+        record = {
+            "run_id": run_id,
+            "session_id": session_id,
+            "agent_ref": agent_ref,
+            "guard": guard,
+            "route": route,
+            "started_at": time.time(),
+            "task": task,
+        }
+        self._active_sessions[session_id] = guard
+        if task is not None:
+            self._session_tasks[session_id] = task
+        self._api_session_runs[session_id] = record
+        return record, None
+
+    def _release_api_session_run(self, session_id: str, record: Dict[str, Any]) -> None:
+        if self._api_session_runs.get(session_id) is record:
+            self._api_session_runs.pop(session_id, None)
+        self._cleanup_finished_session_task(session_id, record.get("guard"))
+
+    async def _wait_for_api_session_agent(
+        self,
+        record: Dict[str, Any],
+        *,
+        timeout_s: float = 0.25,
+    ) -> Any:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            agent_ref = record.get("agent_ref")
+            agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
+            if agent is not None:
+                return agent
+            task = record.get("task")
+            if task is not None and getattr(task, "done", lambda: False)():
+                return None
+            await asyncio.sleep(0.01)
+        agent_ref = record.get("agent_ref")
+        return agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
 
     async def _handle_list_sessions(self, request: "web.Request") -> "web.Response":
         """GET /api/sessions — list persisted Hermes sessions."""
@@ -2366,31 +2453,66 @@ class APIServerAdapter(BasePlatformAdapter):
         audio_err = self._reject_unsupported_audio_content(user_message, param="message")
         if audio_err is not None:
             return audio_err
-        history = self._conversation_history_for_session(session_id)
-        audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
-        if audio_err is not None:
-            return audio_err
-        result, usage = await self._run_agent(
-            user_message=user_message,
-            conversation_history=history,
-            ephemeral_system_prompt=system_prompt,
-            session_id=session_id,
-            gateway_session_key=gateway_session_key,
-        )
-        effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
-        final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
-        headers = {"X-Hermes-Session-Id": effective_session_id or session_id}
-        if gateway_session_key:
-            headers["X-Hermes-Session-Key"] = gateway_session_key
-        return web.json_response(
-            {
+        run_id = f"run_{uuid.uuid4().hex}"
+        record, busy = self._claim_api_session_run(session_id, run_id, route="chat")
+        if busy is not None:
+            return busy
+        agent_task: Optional[asyncio.Task] = None
+        try:
+            history = self._conversation_history_for_session(session_id)
+            audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
+            if audio_err is not None:
+                return audio_err
+            agent_task = asyncio.create_task(self._run_agent(
+                user_message=user_message,
+                conversation_history=history,
+                ephemeral_system_prompt=system_prompt,
+                session_id=session_id,
+                agent_ref=record["agent_ref"] if record else None,
+                gateway_session_key=gateway_session_key,
+            ))
+            if record is not None:
+                record["task"] = agent_task
+                self._session_tasks[session_id] = agent_task
+            try:
+                self._background_tasks.add(agent_task)
+            except TypeError:
+                pass
+            if hasattr(agent_task, "add_done_callback"):
+                agent_task.add_done_callback(self._background_tasks.discard)
+            result, usage = await asyncio.shield(agent_task)
+            effective_session_id = result.get("session_id") if isinstance(result, dict) else session_id
+            final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
+            headers = {
+                "X-Hermes-Session-Id": effective_session_id or session_id,
+                "X-Hermes-Run-Id": run_id,
+            }
+            if gateway_session_key:
+                headers["X-Hermes-Session-Key"] = gateway_session_key
+            payload = {
                 "object": "hermes.session.chat.completion",
                 "session_id": effective_session_id or session_id,
+                "run_id": run_id,
                 "message": {"role": "assistant", "content": final_response},
                 "usage": usage,
-            },
-            headers=headers,
-        )
+            }
+            if isinstance(result, dict) and result.get("pending_steer"):
+                payload["pending_steer"] = result["pending_steer"]
+            return web.json_response(payload, headers=headers)
+        finally:
+            if record is not None:
+                if agent_task is not None and not agent_task.done():
+                    def _release_after_agent_done(done_task: asyncio.Task) -> None:
+                        try:
+                            if not done_task.cancelled():
+                                done_task.exception()
+                        except Exception:
+                            logger.debug("[api_server] session chat task ended with error", exc_info=True)
+                        self._release_api_session_run(session_id, record)
+
+                    agent_task.add_done_callback(_release_after_agent_done)
+                else:
+                    self._release_api_session_run(session_id, record)
 
     async def _handle_session_chat_stream(self, request: "web.Request") -> "web.StreamResponse":
         """POST /api/sessions/{session_id}/chat/stream — SSE wrapper over _run_agent."""
@@ -2416,15 +2538,20 @@ class APIServerAdapter(BasePlatformAdapter):
         audio_err = self._reject_unsupported_audio_content(user_message, param="message")
         if audio_err is not None:
             return audio_err
+        run_id = f"run_{uuid.uuid4().hex}"
+        record, busy = self._claim_api_session_run(session_id, run_id, route="chat_stream")
+        if busy is not None:
+            return busy
         history = self._conversation_history_for_session(session_id)
         audio_err = self._reject_unsupported_audio_content(history, param="conversation_history")
         if audio_err is not None:
+            if record is not None:
+                self._release_api_session_run(session_id, record)
             return audio_err
 
         loop = asyncio.get_running_loop()
         queue: "asyncio.Queue[Optional[tuple[str, Dict[str, Any]]]]" = asyncio.Queue()
         message_id = f"msg_{uuid.uuid4().hex}"
-        run_id = f"run_{uuid.uuid4().hex}"
         tool_started_at: dict[str, float] = {}
         seq = 0
 
@@ -2507,6 +2634,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     tool_progress_callback=_tool_progress,
                     tool_start_callback=_on_tool_start,
                     tool_complete_callback=_on_tool_complete,
+                    agent_ref=record["agent_ref"] if record else None,
                     gateway_session_key=gateway_session_key,
                 )
                 final_response = _resolve_media_to_data_urls(result.get("final_response", "") if isinstance(result, dict) else "")
@@ -2520,21 +2648,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     "partial": False,
                     "interrupted": False,
                 }))
-                await queue.put(_event_payload("run.completed", {
+                completed_payload = {
                     "session_id": effective_session_id,
                     "message_id": message_id,
                     "completed": True,
                     "messages": turn_messages,
                     "usage": usage,
-                }))
+                }
+                if isinstance(result, dict) and result.get("pending_steer"):
+                    completed_payload["pending_steer"] = result["pending_steer"]
+                await queue.put(_event_payload("run.completed", completed_payload))
             except Exception as exc:
                 logger.exception("[api_server] session chat stream failed")
                 await queue.put(_event_payload("error", {"message": _redact_api_error_text(exc)}))
             finally:
-                await queue.put(_event_payload("done", {}))
-                await queue.put(None)
+                try:
+                    queue.put_nowait(_event_payload("done", {}))
+                except Exception:
+                    pass
+                try:
+                    queue.put_nowait(None)
+                except Exception:
+                    pass
+                if record is not None:
+                    self._release_api_session_run(session_id, record)
 
         task = asyncio.create_task(_run_and_signal())
+        if record is not None:
+            record["task"] = task
+            self._session_tasks[session_id] = task
         try:
             self._background_tasks.add(task)
         except TypeError:
@@ -2547,6 +2689,7 @@ class APIServerAdapter(BasePlatformAdapter):
             "Cache-Control": "no-cache",
             "X-Accel-Buffering": "no",
             "X-Hermes-Session-Id": session_id,
+            "X-Hermes-Run-Id": run_id,
         }
         if gateway_session_key:
             headers["X-Hermes-Session-Key"] = gateway_session_key
@@ -2568,11 +2711,110 @@ class APIServerAdapter(BasePlatformAdapter):
                 await response.write(f"event: {name}\ndata: {data}\n\n".encode("utf-8"))
                 last_write = time.monotonic()
         except (asyncio.CancelledError, ConnectionResetError):
-            task.cancel()
+            agent_ref = record.get("agent_ref") if record is not None else None
+            agent = agent_ref[0] if isinstance(agent_ref, list) and agent_ref else None
+            if agent is not None:
+                try:
+                    agent.interrupt("SSE client disconnected")
+                except Exception:
+                    pass
             raise
         except Exception as exc:
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
+
+    async def _handle_session_steer(self, request: "web.Request") -> "web.Response":
+        """POST /api/sessions/{session_id}/steer — steer the active session turn."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        session_id = request.match_info["session_id"]
+        _, err = self._get_existing_session_or_404(session_id)
+        if err:
+            return err
+        body, err = await self._read_json_body(request)
+        if err:
+            return err
+        message = body.get("message")
+        if not isinstance(message, str) or not message.strip():
+            return web.json_response(
+                _openai_error("message must be a non-empty string", code="invalid_message"),
+                status=400,
+            )
+
+        self._heal_stale_session_lock(session_id)
+        if session_id not in self._active_sessions:
+            self._api_session_runs.pop(session_id, None)
+            payload = _openai_error(
+                "Session has no active run to steer",
+                err_type="session_not_running",
+                code="no_active_run",
+            )
+            payload["session_id"] = session_id
+            return web.json_response(payload, status=409)
+
+        record = self._api_session_runs.get(session_id)
+        if record is None:
+            payload = _openai_error(
+                "Active session run is not steerable yet",
+                err_type="session_not_running",
+                code="run_not_steerable_yet",
+            )
+            payload["session_id"] = session_id
+            return web.json_response(payload, status=409)
+
+        agent = await self._wait_for_api_session_agent(record)
+        if agent is None or not hasattr(agent, "steer"):
+            payload = _openai_error(
+                "Active session run is not steerable yet",
+                err_type="session_not_running",
+                code="run_not_steerable_yet",
+            )
+            payload.update({
+                "session_id": session_id,
+                "active_run_id": record.get("run_id"),
+            })
+            return web.json_response(payload, status=409)
+
+        task = record.get("task")
+        if (
+            self._api_session_runs.get(session_id) is not record
+            or session_id not in self._active_sessions
+            or (task is not None and getattr(task, "done", lambda: False)())
+        ):
+            if task is not None and getattr(task, "done", lambda: False)():
+                self._release_api_session_run(session_id, record)
+            payload = _openai_error(
+                "Session has no active run to steer",
+                err_type="session_not_running",
+                code="no_active_run",
+            )
+            payload["session_id"] = session_id
+            return web.json_response(payload, status=409)
+
+        try:
+            accepted = bool(agent.steer(message.strip()))
+        except Exception as exc:
+            logger.warning("[api_server] steer failed for session %s: %s", session_id, exc)
+            return web.json_response(
+                _openai_error("Active run rejected steer", code="steer_rejected"),
+                status=409,
+            )
+        if not accepted:
+            return web.json_response(
+                _openai_error("message must be a non-empty string", code="invalid_message"),
+                status=400,
+            )
+
+        return web.json_response(
+            {
+                "object": "hermes.session.steer",
+                "session_id": session_id,
+                "active_run_id": record.get("run_id"),
+                "status": "accepted",
+            },
+            status=202,
+        )
 
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
@@ -5337,6 +5579,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_delete("/api/sessions/{session_id}", self._handle_delete_session)
             self._app.router.add_get("/api/sessions/{session_id}/messages", self._handle_session_messages)
             self._app.router.add_post("/api/sessions/{session_id}/fork", self._handle_fork_session)
+            self._app.router.add_post("/api/sessions/{session_id}/steer", self._handle_session_steer)
             self._app.router.add_post("/api/sessions/{session_id}/chat", self._handle_session_chat)
             self._app.router.add_post("/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream)
             self._app.router.add_post("/v1/chat/completions", self._handle_chat_completions)

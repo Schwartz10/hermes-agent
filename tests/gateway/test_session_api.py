@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import asyncio
 import json
 from unittest.mock import AsyncMock, patch
 
@@ -47,6 +48,7 @@ def _create_session_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_delete("/api/sessions/{session_id}", adapter._handle_delete_session)
     app.router.add_get("/api/sessions/{session_id}/messages", adapter._handle_session_messages)
     app.router.add_post("/api/sessions/{session_id}/fork", adapter._handle_fork_session)
+    app.router.add_post("/api/sessions/{session_id}/steer", adapter._handle_session_steer)
     app.router.add_post("/api/sessions/{session_id}/chat", adapter._handle_session_chat)
     app.router.add_post("/api/sessions/{session_id}/chat/stream", adapter._handle_session_chat_stream)
     return app
@@ -84,6 +86,9 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert features["session_chat"] is True
     assert features["session_chat_streaming"] is True
     assert features["session_fork"] is True
+    assert features["session_busy_handling"] is True
+    assert features["session_steer"] is True
+    assert "session_queue" not in features
     assert features["admin_config_rw"] is False
     assert features["memory_write_api"] is False
     assert features["skills_api"] is True
@@ -92,6 +97,10 @@ async def test_capabilities_advertises_session_control_surface(adapter):
     assert data["endpoints"]["session_chat_stream"] == {
         "method": "POST",
         "path": "/api/sessions/{session_id}/chat/stream",
+    }
+    assert data["endpoints"]["session_steer"] == {
+        "method": "POST",
+        "path": "/api/sessions/{session_id}/steer",
     }
 
 
@@ -272,6 +281,127 @@ async def test_session_chat_loads_history_and_preserves_session_headers(auth_ada
 
 
 @pytest.mark.asyncio
+async def test_session_chat_returns_busy_for_concurrent_turn(auth_adapter, session_db):
+    session_id = session_db.create_session("busy-chat-session", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_run(**kwargs):
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", side_effect=slow_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    json={"message": "first"},
+                    headers={"Authorization": "Bearer sk-test"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            busy_resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "second"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            busy = await busy_resp.json()
+            release.set()
+            first_resp = await first
+            first_payload = await first_resp.json()
+
+    assert busy_resp.status == 409
+    assert busy["error"]["code"] == "session_busy"
+    assert busy["error"]["type"] == "session_busy"
+    assert busy["session_id"] == session_id
+    assert busy["active_run_id"].startswith("run_")
+    assert busy["accepted_behaviors"] == ["steer", "reject"]
+    assert first_resp.status == 200
+    assert first_payload["run_id"].startswith("run_")
+
+
+@pytest.mark.asyncio
+async def test_session_chat_blocks_concurrent_stream(auth_adapter, session_db):
+    session_id = session_db.create_session("busy-chat-stream-session", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_run(**kwargs):
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", side_effect=slow_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    json={"message": "first"},
+                    headers={"Authorization": "Bearer sk-test"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            busy_resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "second"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            busy = await busy_resp.json()
+            release.set()
+            first_resp = await first
+            await first_resp.json()
+
+    assert busy_resp.status == 409
+    assert busy["error"]["code"] == "session_busy"
+    assert busy["active_run_id"].startswith("run_")
+    assert busy_resp.headers["Content-Type"].startswith("application/json")
+
+
+@pytest.mark.asyncio
+async def test_session_chat_cancel_keeps_guard_until_agent_finishes(auth_adapter, session_db):
+    session_id = session_db.create_session("cancelled-chat-session", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeRequest:
+        def __init__(self, message):
+            self.match_info = {"session_id": session_id}
+            self.headers = {"Authorization": "Bearer sk-test"}
+            self._message = message
+
+        async def json(self):
+            return {"message": self._message}
+
+    async def slow_run(**kwargs):
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    with patch.object(auth_adapter, "_run_agent", side_effect=slow_run):
+        first = asyncio.create_task(auth_adapter._handle_session_chat(FakeRequest("first")))
+        await asyncio.wait_for(started.wait(), timeout=1)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+
+        busy_resp = await auth_adapter._handle_session_chat(FakeRequest("second"))
+        busy = json.loads(busy_resp.text)
+        release.set()
+        for _ in range(50):
+            if session_id not in auth_adapter._active_sessions:
+                break
+            await asyncio.sleep(0.01)
+
+    assert busy_resp.status == 409
+    assert busy["error"]["code"] == "session_busy"
+    assert busy["active_run_id"].startswith("run_")
+    assert session_id not in auth_adapter._active_sessions
+
+
+@pytest.mark.asyncio
 async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db):
     session_id = session_db.create_session("image-session", "api_server")
     image_payload = [
@@ -322,6 +452,152 @@ async def test_session_chat_rejects_unsupported_audio_before_run(auth_adapter, s
 
 
 @pytest.mark.asyncio
+async def test_session_steer_calls_active_agent(auth_adapter, session_db):
+    session_id = session_db.create_session("steer-session", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class FakeAgent:
+        def __init__(self):
+            self.steers = []
+
+        def steer(self, text):
+            self.steers.append(text)
+            return True
+
+    agent = FakeAgent()
+
+    async def slow_run(**kwargs):
+        kwargs["agent_ref"][0] = agent
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", side_effect=slow_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    json={"message": "work"},
+                    headers={"Authorization": "Bearer sk-test"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            steer_resp = await cli.post(
+                f"/api/sessions/{session_id}/steer",
+                json={"message": "actually inspect logs"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            steer = await steer_resp.json()
+            release.set()
+            first_resp = await first
+            await first_resp.json()
+
+    assert steer_resp.status == 202
+    assert steer["object"] == "hermes.session.steer"
+    assert steer["session_id"] == session_id
+    assert steer["active_run_id"].startswith("run_")
+    assert steer["status"] == "accepted"
+    assert agent.steers == ["actually inspect logs"]
+
+
+@pytest.mark.asyncio
+async def test_session_steer_rejects_without_active_run(auth_adapter, session_db):
+    session_id = session_db.create_session("no-active-steer-session", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/steer",
+            json={"message": "adjust"},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 409
+    assert body["error"]["code"] == "no_active_run"
+    assert body["error"]["type"] == "session_not_running"
+    assert body["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_session_steer_rejects_before_agent_attaches(auth_adapter, session_db):
+    session_id = session_db.create_session("not-attached-steer-session", "api_server")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_run(**kwargs):
+        started.set()
+        await release.wait()
+        return {"final_response": "done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", side_effect=slow_run):
+        async with TestClient(TestServer(app)) as cli:
+            first = asyncio.create_task(
+                cli.post(
+                    f"/api/sessions/{session_id}/chat",
+                    json={"message": "work"},
+                    headers={"Authorization": "Bearer sk-test"},
+                )
+            )
+            await asyncio.wait_for(started.wait(), timeout=1)
+            steer_resp = await cli.post(
+                f"/api/sessions/{session_id}/steer",
+                json={"message": "adjust"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            steer = await steer_resp.json()
+            release.set()
+            first_resp = await first
+            await first_resp.json()
+
+    assert steer_resp.status == 409
+    assert steer["error"]["code"] == "run_not_steerable_yet"
+    assert steer["session_id"] == session_id
+
+
+@pytest.mark.asyncio
+async def test_session_steer_rejects_empty_message(auth_adapter, session_db):
+    session_id = session_db.create_session("empty-steer-session", "api_server")
+    app = _create_session_app(auth_adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(
+            f"/api/sessions/{session_id}/steer",
+            json={"message": "   "},
+            headers={"Authorization": "Bearer sk-test"},
+        )
+        body = await resp.json()
+
+    assert resp.status == 400
+    assert body["error"]["code"] == "invalid_message"
+
+
+@pytest.mark.asyncio
+async def test_session_chat_surfaces_pending_steer(auth_adapter, session_db):
+    session_id = session_db.create_session("pending-steer-chat-session", "api_server")
+
+    mock_run = AsyncMock(
+        return_value=(
+            {"final_response": "done", "session_id": session_id, "pending_steer": "late steer"},
+            {"total_tokens": 1},
+        )
+    )
+    app = _create_session_app(auth_adapter)
+    with patch.object(auth_adapter, "_run_agent", mock_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "work"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            body = await resp.json()
+
+    assert resp.status == 200
+    assert body["pending_steer"] == "late steer"
+
+
+@pytest.mark.asyncio
 async def test_session_chat_stream_accepts_multimodal_message(adapter, session_db):
     session_id = session_db.create_session("image-stream-session", "api_server")
     image_payload = [
@@ -352,6 +628,37 @@ async def test_session_chat_stream_accepts_multimodal_message(adapter, session_d
 
     assert "event: assistant.completed" in body
     assert captured_kwargs["user_message"] == expected_user_message
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_blocks_concurrent_chat(adapter, session_db):
+    session_id = session_db.create_session("busy-stream-session", "api_server")
+    release = asyncio.Event()
+
+    async def slow_run(**kwargs):
+        await release.wait()
+        return {"final_response": "stream done", "session_id": session_id}, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=slow_run):
+        async with TestClient(TestServer(app)) as cli:
+            stream_resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "stream first"},
+            )
+            assert stream_resp.status == 200
+            busy_resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "second"},
+            )
+            busy = await busy_resp.json()
+            release.set()
+            body = await stream_resp.text()
+
+    assert busy_resp.status == 409
+    assert busy["error"]["code"] == "session_busy"
+    assert busy["active_run_id"].startswith("run_")
+    assert "event: run.completed" in body
 
 
 @pytest.mark.asyncio
@@ -403,6 +710,32 @@ async def test_session_chat_stream_emits_lifecycle_events_and_keepalive_safe_sha
     assert "event: assistant.completed" in body
     assert "event: run.completed" in body
     assert "event: done" in body
+
+
+@pytest.mark.asyncio
+async def test_session_chat_stream_surfaces_pending_steer(adapter, session_db):
+    session_id = session_db.create_session("pending-steer-stream-session", "api_server")
+
+    async def fake_run(**kwargs):
+        return {
+            "final_response": "done",
+            "session_id": session_id,
+            "pending_steer": "late steer",
+        }, {"total_tokens": 1}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_run_agent", side_effect=fake_run):
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat/stream",
+                json={"message": "work"},
+            )
+            assert resp.status == 200
+            body = await resp.text()
+
+    events = _parse_sse_events(body)
+    run_completed = next(data for name, data in events if name == "run.completed")
+    assert run_completed["pending_steer"] == "late steer"
 
 
 @pytest.mark.asyncio
