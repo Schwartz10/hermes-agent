@@ -45,6 +45,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 try:
     from aiohttp import ClientSession, ClientTimeout, FormData, web
@@ -483,6 +484,97 @@ def _redact_codex_transcription_error_text(value: Any, *, limit: int = 500) -> s
     text = re.sub(r"(?i)\basset_pointer\b", "asset metadata", text)
     text = re.sub(r"\bptr_[A-Za-z0-9._:-]+", "[redacted-asset-pointer]", text)
     return text[:limit]
+
+
+_CODEX_TRANSCRIPTION_SAFE_RESPONSE_HEADERS = frozenset({
+    "content-type",
+    "cf-ray",
+    "cf-mitigated",
+    "request-id",
+    "x-request-id",
+    "openai-request-id",
+    "x-openai-request-id",
+})
+
+_TRANSCRIPTION_FILENAME_SECRET_RE = re.compile(
+    r"(?i)("
+    r"sk-[A-Za-z0-9_-]{10,}"
+    r"|eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}"
+    r"|(?:access|refresh|id|auth)?token[-_=][A-Za-z0-9_.-]{8,}"
+    r")"
+)
+
+
+def _safe_transcription_response_headers(headers: Any) -> Dict[str, str]:
+    lower_headers: Dict[str, Any] = {}
+    try:
+        lower_headers = {str(k).lower(): v for k, v in headers.items()}
+    except Exception:
+        lower_headers = {}
+
+    safe: Dict[str, str] = {}
+    for name in _CODEX_TRANSCRIPTION_SAFE_RESPONSE_HEADERS:
+        try:
+            value = headers.get(name)
+        except Exception:
+            value = None
+        if value is None:
+            value = lower_headers.get(name)
+        if value is None:
+            continue
+        safe[name] = _redact_api_error_text(value, limit=256)
+    return safe
+
+
+def _safe_transcription_upload_filename(filename: str) -> str:
+    name = str(filename or "").replace("\\", "/").rsplit("/", 1)[-1] or "audio"
+    name = _redact_api_error_text(name, limit=256)
+    return _TRANSCRIPTION_FILENAME_SECRET_RE.sub("[redacted-secret]", name)
+
+
+def _safe_transcription_content_type(content_type: str) -> str:
+    media_type = str(content_type or "").split(";", 1)[0].strip() or "application/octet-stream"
+    return _redact_api_error_text(media_type, limit=256)
+
+
+def _safe_transcription_url_path(url: str) -> str:
+    try:
+        path = urlsplit(url).path or "/"
+    except Exception:
+        path = "/"
+    return _redact_api_error_text(path, limit=512)
+
+
+def _log_codex_transcription_upstream_failure(
+    *,
+    status: int,
+    raw_body: str,
+    headers: Any,
+    url: str,
+    filename: str,
+    content_type: str,
+    byte_length: int,
+    duration_ms_present: bool,
+) -> None:
+    try:
+        diagnostic = {
+            "upstream_status": status,
+            "upstream_body": _redact_codex_transcription_error_text(raw_body, limit=1200),
+            "upstream_headers": _safe_transcription_response_headers(headers),
+            "upload": {
+                "filename": _safe_transcription_upload_filename(filename),
+                "content_type": _safe_transcription_content_type(content_type),
+                "byte_length": max(0, int(byte_length)),
+                "duration_ms_present": bool(duration_ms_present),
+            },
+            "target_path": _safe_transcription_url_path(url),
+        }
+        logger.warning(
+            "codex_audio_transcription_upstream_failed %s",
+            json.dumps(diagnostic, sort_keys=True, separators=(",", ":")),
+        )
+    except Exception:
+        logger.debug("Failed to log Codex transcription upstream failure", exc_info=True)
 
 
 def _codex_transcription_error_message(status: int, payload: Any, raw_body: str) -> str:
@@ -1614,6 +1706,7 @@ class APIServerAdapter(BasePlatformAdapter):
         filename: str,
         content_type: str,
         data: bytes,
+        duration_ms_present: bool = False,
     ) -> tuple[Optional[str], Optional["web.Response"]]:
         if ClientSession is None or ClientTimeout is None or FormData is None:
             return None, web.json_response(
@@ -1671,6 +1764,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
                     if resp.status >= 400:
                         if provider == "openai-codex":
+                            _log_codex_transcription_upstream_failure(
+                                status=resp.status,
+                                raw_body=raw_body,
+                                headers=getattr(resp, "headers", {}),
+                                url=url,
+                                filename=filename,
+                                content_type=content_type,
+                                byte_length=len(data),
+                                duration_ms_present=duration_ms_present,
+                            )
                             message = _codex_transcription_error_message(resp.status, payload, raw_body)
                         else:
                             fallback = raw_body or f"Upstream transcription request failed with HTTP {resp.status}."
@@ -1739,12 +1842,17 @@ class APIServerAdapter(BasePlatformAdapter):
         file_bytes: Optional[bytes] = None
         filename = ""
         content_type = ""
+        duration_ms_present = False
 
         try:
             reader = await request.multipart()
             async for part in reader:
                 if part.name == "model":
                     model = (await part.text()).strip()
+                    continue
+                if part.name == "duration_ms":
+                    duration_ms_present = True
+                    await part.text()
                     continue
                 if part.name != "file":
                     continue
@@ -1811,6 +1919,7 @@ class APIServerAdapter(BasePlatformAdapter):
             filename=filename,
             content_type=content_type,
             data=file_bytes,
+            duration_ms_present=duration_ms_present,
         )
         if upstream_err is not None:
             return upstream_err

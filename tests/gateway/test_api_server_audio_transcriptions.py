@@ -2,6 +2,7 @@
 
 import base64
 import json
+import logging
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -33,10 +34,13 @@ def _multipart(
     filename: str = "voice.ogg",
     content_type: str = "audio/ogg",
     file_field: str = "file",
+    duration_ms: str | None = None,
 ) -> FormData:
     form = FormData()
     if model is not None:
         form.add_field("model", model)
+    if duration_ms is not None:
+        form.add_field("duration_ms", duration_ms)
     if audio is not None:
         form.add_field(file_field, audio, filename=filename, content_type=content_type)
     return form
@@ -64,12 +68,19 @@ class _FakeFormData:
         self.fields.append({"name": name, "value": value, **kwargs})
 
 
-def _install_fake_upstream(monkeypatch, *, status: int = 200, body: str = '{"text":"hello"}') -> dict:
+def _install_fake_upstream(
+    monkeypatch,
+    *,
+    status: int = 200,
+    body: str = '{"text":"hello"}',
+    headers: dict | None = None,
+) -> dict:
     captured = {}
 
     class FakeResponse:
         def __init__(self):
             self.status = status
+            self.headers = dict(headers or {})
 
         async def __aenter__(self):
             return self
@@ -134,7 +145,10 @@ async def test_transcription_succeeds_with_codex_auth():
          patch.object(adapter, "_post_audio_transcription", side_effect=fake_post), \
          patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
         async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post("/v1/audio/transcriptions", data=_multipart(model="gpt-4o-transcribe"))
+            resp = await cli.post(
+                "/v1/audio/transcriptions",
+                data=_multipart(model="gpt-4o-transcribe", duration_ms="1234"),
+            )
             body = await resp.json()
 
     assert resp.status == 200
@@ -148,6 +162,7 @@ async def test_transcription_succeeds_with_codex_auth():
     assert captured["runtime"]["api_key"] == "codex-token"
     assert captured["model"] == "gpt-4o-transcribe"
     assert captured["data"] == b"fake-audio"
+    assert captured["duration_ms_present"] is True
     mock_run.assert_not_called()
     assert adapter._session_db is None
 
@@ -217,6 +232,96 @@ async def test_codex_transcription_403_html_error_is_sanitized(monkeypatch):
     assert "asset_pointer" not in message
     assert "<html" not in message
     assert captured["headers"]["Authorization"] == f"Bearer {token}"
+
+
+@pytest.mark.asyncio
+async def test_codex_transcription_403_logs_sanitized_upstream_diagnostics(monkeypatch, caplog):
+    adapter = _make_adapter()
+    token = _jwt_with_account_id("acct_123")
+    leaked_jwt = (
+        "eyJhbGciOiJub25lIiwidHlwIjoiSldUIn0."
+        "eyJhY2Nlc3NfdG9rZW4iOiJzZWNyZXQtand0In0."
+        "signature"
+    )
+    body = json.dumps({
+        "error": {
+            "message": "missing ChatGPT transcription entitlement",
+            "access_token": "sk-test-super-secret-token",
+            "jwt": leaked_jwt,
+        },
+        "refresh_token": "refresh-secret-token",
+    })
+    _install_fake_upstream(
+        monkeypatch,
+        status=403,
+        body=body,
+        headers={
+            "Content-Type": "application/json",
+            "cf-ray": "abc123-SFO",
+            "cf-mitigated": "challenge",
+            "request-id": "req_123",
+            "x-openai-request-id": "openai_req_456",
+            "set-cookie": "session=secret",
+            "authorization": "Bearer sk-response-secret",
+        },
+    )
+
+    with caplog.at_level(logging.WARNING, logger=api_server_mod.logger.name):
+        transcript, err = await adapter._post_audio_transcription(
+            runtime={
+                "provider": "openai-codex",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_key": token,
+            },
+            model="should-not-forward",
+            filename="/tmp/recording-sk-test-super-secret-token.ogg",
+            content_type="audio/ogg",
+            data=b"fake-audio",
+            duration_ms_present=True,
+        )
+
+    assert transcript is None
+    assert err is not None
+    assert err.status == 403
+    response_body = json.loads(err.text)
+    assert response_body["error"]["message"] == "ChatGPT transcription rejected request."
+
+    records = [
+        rec for rec in caplog.records
+        if rec.name == api_server_mod.logger.name
+        and rec.getMessage().startswith("codex_audio_transcription_upstream_failed ")
+    ]
+    assert len(records) == 1
+    log_line = records[0].getMessage()
+    diagnostic = json.loads(log_line.split(" ", 1)[1])
+
+    assert diagnostic["upstream_status"] == 403
+    assert "missing ChatGPT transcription entitlement" in diagnostic["upstream_body"]
+    assert len(diagnostic["upstream_body"]) <= 1200
+    assert diagnostic["target_path"] == "/backend-api/transcribe"
+    assert "https://chatgpt.com" not in log_line
+    assert diagnostic["upstream_headers"] == {
+        "cf-mitigated": "challenge",
+        "cf-ray": "abc123-SFO",
+        "content-type": "application/json",
+        "request-id": "req_123",
+        "x-openai-request-id": "openai_req_456",
+    }
+    assert diagnostic["upload"]["filename"].startswith("recording-")
+    assert diagnostic["upload"]["filename"].endswith(".ogg")
+    assert "/tmp" not in diagnostic["upload"]["filename"]
+    assert diagnostic["upload"]["content_type"] == "audio/ogg"
+    assert diagnostic["upload"]["byte_length"] == len(b"fake-audio")
+    assert diagnostic["upload"]["duration_ms_present"] is True
+    assert "set-cookie" not in log_line
+    assert "authorization" not in log_line.lower()
+    assert "Bearer" not in log_line
+    assert "sk-test-super-secret-token" not in log_line
+    assert "sk-response-secret" not in log_line
+    assert leaked_jwt not in log_line
+    assert token not in log_line
+    assert "refresh-secret-token" not in log_line
+    assert "fake-audio" not in log_line
 
 
 @pytest.mark.asyncio
