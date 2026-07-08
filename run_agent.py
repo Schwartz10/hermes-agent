@@ -1844,15 +1844,13 @@ class AIAgent:
                 if _is_multimodal_tool_result(content):
                     content = _multimodal_text_summary(content)
                 elif isinstance(content, list):
-                    # List of OpenAI-style content parts: strip media, keep text.
+                    # List of OpenAI-style content parts: strip images, keep text.
                     _txt = []
                     for p in content:
                         if isinstance(p, dict) and p.get("type") == "text":
                             _txt.append(str(p.get("text", "")))
                         elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
                             _txt.append("[screenshot]")
-                        elif isinstance(p, dict) and p.get("type") in {"audio", "input_audio"}:
-                            _txt.append("[audio]")
                     content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
                 if hasattr(msg, "tool_calls") and isinstance(msg.tool_calls, list) and msg.tool_calls:

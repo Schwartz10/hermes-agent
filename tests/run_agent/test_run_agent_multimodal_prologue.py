@@ -96,7 +96,7 @@ class TestChatContentToResponsesParts:
     def test_unknown_parts_skipped(self):
         """Unknown types shouldn't crash — filtered silently at this level
         (the API server's normalizer rejects them earlier)."""
-        content = [{"type": "text", "text": "ok"}, {"type": "video", "x": "y"}]
+        content = [{"type": "text", "text": "ok"}, {"type": "audio", "x": "y"}]
         assert _chat_content_to_responses_parts(content) == [{"type": "input_text", "text": "ok"}]
 
     def test_empty_url_image_skipped(self):

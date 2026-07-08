@@ -429,29 +429,6 @@ async def test_session_chat_accepts_multimodal_message(auth_adapter, session_db)
 
 
 @pytest.mark.asyncio
-async def test_session_chat_rejects_unsupported_audio_before_run(auth_adapter, session_db):
-    session_id = session_db.create_session("audio-session", "api_server")
-    audio_payload = [
-        {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
-    ]
-
-    app = _create_session_app(auth_adapter)
-    with patch.object(auth_adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                f"/api/sessions/{session_id}/chat",
-                json={"message": audio_payload},
-                headers={"Authorization": "Bearer sk-test"},
-            )
-            body = await resp.json()
-
-    assert resp.status == 400
-    assert body["error"]["code"] == "unsupported_audio_input"
-    assert "/v1/audio/transcriptions" in body["error"]["message"]
-    mock_run.assert_not_called()
-
-
-@pytest.mark.asyncio
 async def test_session_steer_calls_active_agent(auth_adapter, session_db):
     session_id = session_db.create_session("steer-session", "api_server")
     started = asyncio.Event()
@@ -696,28 +673,6 @@ async def test_session_chat_stream_blocks_concurrent_chat(adapter, session_db):
     assert busy["error"]["code"] == "session_busy"
     assert busy["active_run_id"].startswith("run_")
     assert "event: run.completed" in body
-
-
-@pytest.mark.asyncio
-async def test_session_chat_stream_rejects_unsupported_audio_before_sse(adapter, session_db):
-    session_id = session_db.create_session("audio-stream-session", "api_server")
-    audio_payload = [
-        {"type": "input_audio", "input_audio": {"data": "ZmFrZQ==", "format": "ogg"}},
-    ]
-
-    app = _create_session_app(adapter)
-    with patch.object(adapter, "_run_agent", new_callable=AsyncMock) as mock_run:
-        async with TestClient(TestServer(app)) as cli:
-            resp = await cli.post(
-                f"/api/sessions/{session_id}/chat/stream",
-                json={"message": audio_payload},
-            )
-            body = await resp.json()
-
-    assert resp.status == 400
-    assert body["error"]["code"] == "unsupported_audio_input"
-    assert "/v1/audio/transcriptions" in body["error"]["message"]
-    mock_run.assert_not_called()
 
 
 @pytest.mark.asyncio
