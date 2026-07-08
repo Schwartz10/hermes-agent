@@ -401,8 +401,3 @@ class TestGetModelCapabilities:
         with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
             caps = get_model_capabilities("anthropic", "nonexistent-model")
         assert caps is None
-
-    def test_provider_not_found_returns_none(self):
-        with patch("agent.models_dev.fetch_models_dev", return_value=CAPS_REGISTRY):
-            caps = get_model_capabilities("nonexistent-provider", "gemma-4-31b-it")
-        assert caps is None

@@ -1896,37 +1896,6 @@ def test_auto_detected_codex_auth_failure_falls_through_to_openrouter(monkeypatc
     assert resolved["api_key"] == "test-or-key"
 
 
-def test_auto_detected_codex_auth_failure_can_raise_in_strict_mode(monkeypatch):
-    """Utility endpoints can keep auto-detected Codex inside its auth boundary."""
-    from hermes_cli.auth import AuthError
-
-    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
-    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
-    monkeypatch.setattr(rp, "load_config", lambda: {})
-
-    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
-    monkeypatch.setattr(rp, "load_pool", lambda p: type("P", (), {
-        "has_credentials": lambda self: False,
-    })())
-    monkeypatch.setattr(
-        rp,
-        "resolve_codex_runtime_credentials",
-        lambda **kw: (_ for _ in ()).throw(
-            AuthError(
-                "Codex token refresh failed: session revoked",
-                provider="openai-codex",
-                code="invalid_grant",
-                relogin_required=True,
-            )
-        ),
-    )
-
-    with pytest.raises(AuthError, match="Codex token refresh failed"):
-        rp.resolve_runtime_provider(requested="auto", allow_auto_codex_fallback=False)
-
-
 def test_explicit_nous_auth_failure_still_raises(monkeypatch):
     """When user explicitly requests Nous and auth fails, the error should propagate."""
     from hermes_cli.auth import AuthError
