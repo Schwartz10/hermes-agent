@@ -480,8 +480,7 @@ def get_model_capabilities(provider: str, model: str) -> Optional[ModelCapabilit
     else:
         input_mods = None
     if isinstance(input_mods, list):
-        input_mod_values = {str(mod).strip().lower() for mod in input_mods}
-        supports_vision = "image" in input_mod_values
+        supports_vision = "image" in input_mods
     else:
         supports_vision = bool(entry.get("attachment", False))
     supports_reasoning = bool(entry.get("reasoning", False))
