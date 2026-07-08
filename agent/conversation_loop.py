@@ -565,6 +565,10 @@ def run_conversation(
         except Exception:
             pass
 
+    _open_steer_window = getattr(agent, "_open_steer_window", None)
+    if callable(_open_steer_window):
+        _open_steer_window()
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-

@@ -2717,6 +2717,29 @@ class AIAgent:
             with _steer_lock:
                 self._pending_steer = None
 
+    def _open_steer_window(self) -> None:
+        """Allow steer() calls for the current turn."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = True
+            return
+        with _lock:
+            self._steer_accepting = True
+
+    def _close_steer_window_and_drain(self) -> Optional[str]:
+        """Stop accepting steers and return any final undelivered text."""
+        _lock = getattr(self, "_pending_steer_lock", None)
+        if _lock is None:
+            self._steer_accepting = False
+            text = getattr(self, "_pending_steer", None)
+            self._pending_steer = None
+            return text
+        with _lock:
+            self._steer_accepting = False
+            text = self._pending_steer
+            self._pending_steer = None
+        return text
+
     def steer(self, text: str) -> bool:
         """
         Inject a user message into the next tool result without interrupting.
@@ -2733,7 +2756,8 @@ class AIAgent:
             text: The user text to inject. Empty strings are ignored.
 
         Returns:
-            True if the steer was accepted, False if the text was empty.
+            True if the steer was accepted, False if the text was empty or
+            the current turn can no longer consume/return a steer.
         """
         if not text or not text.strip():
             return False
@@ -2743,10 +2767,14 @@ class AIAgent:
             # Test stubs that built AIAgent via object.__new__ skip __init__.
             # Fall back to direct attribute set; no concurrent callers expected
             # in those stubs.
+            if getattr(self, "_steer_accepting", True) is False:
+                return False
             existing = getattr(self, "_pending_steer", None)
             self._pending_steer = (existing + "\n" + cleaned) if existing else cleaned
             return True
         with _lock:
+            if getattr(self, "_steer_accepting", True) is False:
+                return False
             if self._pending_steer:
                 self._pending_steer = self._pending_steer + "\n" + cleaned
             else:
