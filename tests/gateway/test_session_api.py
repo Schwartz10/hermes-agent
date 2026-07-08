@@ -574,6 +574,43 @@ async def test_session_steer_rejects_empty_message(auth_adapter, session_db):
 
 
 @pytest.mark.asyncio
+async def test_session_steer_rejects_after_turn_stops_accepting(auth_adapter, session_db):
+    session_id = session_db.create_session("late-steer-session", "api_server")
+    record, busy = auth_adapter._claim_api_session_run(session_id, "run_late", route="chat")
+    assert busy is None
+
+    class ClosedAgent:
+        def __init__(self):
+            self.calls = []
+
+        def steer(self, text):
+            self.calls.append(text)
+            return False
+
+    agent = ClosedAgent()
+    record["agent_ref"][0] = agent
+
+    try:
+        app = _create_session_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/steer",
+                json={"message": "too late"},
+                headers={"Authorization": "Bearer sk-test"},
+            )
+            body = await resp.json()
+    finally:
+        auth_adapter._release_api_session_run(session_id, record)
+
+    assert resp.status == 409
+    assert body["error"]["code"] == "no_active_run"
+    assert body["error"]["type"] == "session_not_running"
+    assert body["session_id"] == session_id
+    assert body["active_run_id"] == "run_late"
+    assert agent.calls == ["too late"]
+
+
+@pytest.mark.asyncio
 async def test_session_chat_surfaces_pending_steer(auth_adapter, session_db):
     session_id = session_db.create_session("pending-steer-chat-session", "api_server")
 

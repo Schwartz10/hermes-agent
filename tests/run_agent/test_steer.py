@@ -23,6 +23,7 @@ def _bare_agent() -> AIAgent:
     agent = object.__new__(AIAgent)
     agent._pending_steer = None
     agent._pending_steer_lock = threading.Lock()
+    agent._steer_accepting = True
     return agent
 
 
@@ -70,6 +71,14 @@ class TestSteerDrain:
     def test_drain_on_empty_returns_none(self):
         agent = _bare_agent()
         assert agent._drain_pending_steer() is None
+
+    def test_close_window_drains_and_rejects_late_steer(self):
+        agent = _bare_agent()
+        assert agent.steer("arrived before final drain") is True
+
+        assert agent._close_steer_window_and_drain() == "arrived before final drain"
+        assert agent.steer("too late") is False
+        assert agent._pending_steer is None
 
 
 class TestSteerInjection:

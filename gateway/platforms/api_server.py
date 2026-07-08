@@ -2801,9 +2801,18 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=409,
             )
         if not accepted:
+            payload = _openai_error(
+                "Session has no active run to steer",
+                err_type="session_not_running",
+                code="no_active_run",
+            )
+            payload.update({
+                "session_id": session_id,
+                "active_run_id": record.get("run_id"),
+            })
             return web.json_response(
-                _openai_error("message must be a non-empty string", code="invalid_message"),
-                status=400,
+                payload,
+                status=409,
             )
 
         return web.json_response(
